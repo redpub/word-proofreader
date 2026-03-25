@@ -51,6 +51,7 @@ Be conservative — only suggest changes that genuinely improve the document. Wh
 # Available LLM models
 POPULAR_MODELS = [
     "x-ai/grok-4.1-fast",
+    "meta-llama/llama-4-maverick"
 ]
 
 # Processing configuration
