@@ -2,3 +2,6 @@ streamlit
 docx-revisions
 python-docx
 lxml
+openai
+pydantic
+requests

@@ -1,0 +1,24 @@
+# Streamlit configuration for Word Proofreader app
+
+[theme]
+# Use default Streamlit theme
+primaryColor = "#FF4B4B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"
+font = "sans serif"
+
+[server]
+# Server configuration
+maxUploadSize = 200  # Maximum file upload size in MB
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+# Browser configuration
+gatherUsageStats = false
+
+[client]
+# Client configuration
+showErrorDetails = true
+toolbarMode = "minimal"
