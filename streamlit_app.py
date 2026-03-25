@@ -521,7 +521,7 @@ def main():
         
         author_name = st.text_input(
             "作者名稱",
-            value="AI 校對",
+            value="紅出版",
             help="顯示在追蹤修訂中的名稱"
         )
         
