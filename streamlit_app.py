@@ -548,8 +548,7 @@ def main():
         
         st.markdown("---")
         st.markdown("### 關於")
-        st.markdown("本應用程式使用 AI 校對 Word 文件，並以追蹤修訂模式套用修正。")
-        st.markdown("[查看文件](https://balalofernandez.github.io/docx-revisions/)")
+        st.markdown("本應用程式使用 AI 校對 Word 文件，並以追蹤修訂模式加入修正。")        
     
     uploaded_file = st.file_uploader(
         "上傳 Word 文件 (.docx)",
