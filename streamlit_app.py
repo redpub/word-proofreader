@@ -61,6 +61,56 @@ def check_api_credits(api_key: str) -> Optional[Dict]:
     except Exception:
         return None
 
+def check_for_tracked_changes(rdoc: RevisionDocument) -> Tuple[bool, int]:
+    """
+    Check if the document has any pending tracked changes (insertions or deletions).
+    Returns (has_changes, count) where has_changes is True if tracked changes exist.
+    """
+    from docx import Document
+    from docx.oxml.text.paragraph import CT_P
+    from docx.oxml.ns import qn
+    
+    change_count = 0
+    
+    # Access the underlying document
+    doc = rdoc._document
+    
+    # Check all paragraphs for tracked changes
+    for paragraph in doc.paragraphs:
+        # Check for insertions (w:ins)
+        insertions = paragraph._element.findall(qn('w:ins'))
+        change_count += len(insertions)
+        
+        # Check for deletions (w:del)
+        deletions = paragraph._element.findall(qn('w:del'))
+        change_count += len(deletions)
+        
+        # Check for move from/to
+        move_from = paragraph._element.findall(qn('w:moveFrom'))
+        change_count += len(move_from)
+        
+        move_to = paragraph._element.findall(qn('w:moveTo'))
+        change_count += len(move_to)
+    
+    # Also check in tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    insertions = paragraph._element.findall(qn('w:ins'))
+                    change_count += len(insertions)
+                    
+                    deletions = paragraph._element.findall(qn('w:del'))
+                    change_count += len(deletions)
+                    
+                    move_from = paragraph._element.findall(qn('w:moveFrom'))
+                    change_count += len(move_from)
+                    
+                    move_to = paragraph._element.findall(qn('w:moveTo'))
+                    change_count += len(move_to)
+    
+    return (change_count > 0, change_count)
+
 def read_document_paragraphs(rdoc: RevisionDocument) -> str:
     lines = []
     for i, para in enumerate(rdoc.paragraphs):
@@ -570,6 +620,14 @@ def main():
                 rdoc = RevisionDocument(tmp_input_path)
                 document_text = read_document_paragraphs(rdoc)
             
+            # Check for pending tracked changes
+            has_changes, change_count = check_for_tracked_changes(rdoc)
+            if has_changes:
+                st.error(f"❌ 此文件包含 {change_count} 個未處理的追蹤修訂")
+                st.warning("⚠️ 請先在 Microsoft Word 中接受或拒絕所有追蹤修訂，然後重新上傳文件。")
+                st.info("💡 在 Word 中：審閱 → 接受 → 接受所有修訂（或逐一檢視）")
+                return
+            
             st.success(f"✅ 已載入文件，共 {len(rdoc.paragraphs)} 個段落")
             
             with st.expander("📄 文件預覽", expanded=False):
@@ -787,8 +845,7 @@ def main():
         finally:
             if os.path.exists(tmp_input_path):
                 os.unlink(tmp_input_path)
-    else:
-        st.info("👆 上傳 Word 文件以開始使用")
+    else:        
         
         st.markdown("### 使用方法")
         st.markdown("""
