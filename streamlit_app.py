@@ -4,13 +4,18 @@ import os
 import json
 import difflib
 import time
-from typing import List, Dict, Optional, Tuple
+import re
+import traceback
+import requests
+from collections import OrderedDict
+from typing import Any, List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from docx_revisions import RevisionDocument, RevisionParagraph
 from pydantic import BaseModel
 from config import (
-    DEFAULT_SYSTEM_PROMPT,
+    PROMPTS_FILE_PATH,
+    PROMPTS_DIR,
     POPULAR_MODELS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_WORKERS,
@@ -37,6 +42,179 @@ class ProofreadingResponse(BaseModel):
     edits: List[Edit]
     summary: str
 
+# ============================================================================
+# Prompt Management Functions
+# ============================================================================
+
+def _prompt_file_path(name: str) -> str:
+    """Return the .txt file path for a prompt's content."""
+    return os.path.join(PROMPTS_DIR, f"{name}.txt")
+
+def _read_prompt_content(name: str) -> str:
+    """Read prompt content from its .txt file."""
+    path = _prompt_file_path(name)
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    return ""
+
+def _write_prompt_content(name: str, content: str) -> bool:
+    """Write prompt content to its .txt file."""
+    try:
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
+        with open(_prompt_file_path(name), 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
+
+def _delete_prompt_file(name: str) -> bool:
+    """Delete a prompt's .txt file."""
+    path = _prompt_file_path(name)
+    if os.path.exists(path):
+        os.unlink(path)
+    return True
+
+def _save_metadata(prompts: Dict[str, Dict[str, Any]]) -> bool:
+    """Save prompt metadata (without content) to prompts.json."""
+    try:
+        metadata = {
+            "prompts": {
+                name: {"protected": data.get("protected", False)}
+                for name, data in prompts.items()
+            }
+        }
+        with open(PROMPTS_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"無法儲存提示：{str(e)}")
+        return False
+
+def load_prompts() -> Dict[str, Dict[str, Any]]:
+    """
+    Load prompts from prompts.json (metadata) + prompts/*.txt (content).
+    Returns ordered dict with default prompt first.
+    """
+    prompts = OrderedDict()
+    
+    if not os.path.exists(PROMPTS_FILE_PATH):
+        st.error(f"無法載入提示檔案：{PROMPTS_FILE_PATH} 不存在")
+        st.stop()
+    
+    try:
+        with open(PROMPTS_FILE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            loaded_prompts = data.get('prompts', {})
+            
+            # Ensure default prompt is first
+            default_name = "預設"
+            if default_name in loaded_prompts:
+                prompts[default_name] = loaded_prompts[default_name]
+                prompts[default_name]["content"] = _read_prompt_content(default_name)
+            
+            # Add other prompts
+            for name, prompt_data in loaded_prompts.items():
+                if name != default_name:
+                    prompts[name] = prompt_data
+                    prompts[name]["content"] = _read_prompt_content(name)
+    except Exception as e:
+        st.warning(f"無法載入提示檔案：{str(e)}")
+    
+    if not prompts:
+        st.error(f"無法載入提示檔案：{PROMPTS_FILE_PATH} 為空")
+        st.stop()
+    
+    return prompts
+
+_INVALID_PROMPT_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f.]')
+_MAX_PROMPT_NAME_LENGTH = 50
+
+def _validate_prompt_name(name: str) -> Tuple[bool, str]:
+    """Validate that a prompt name is safe for use as a filename."""
+    name = name.strip()
+    if not name:
+        return False, "提示名稱不能為空"
+    if len(name) > _MAX_PROMPT_NAME_LENGTH:
+        return False, f"提示名稱不能超過 {_MAX_PROMPT_NAME_LENGTH} 個字元"
+    if _INVALID_PROMPT_NAME_CHARS.search(name):
+        return False, "提示名稱不能包含特殊字元（\\ / : * ? \" < > | .）"
+    return True, ""
+
+def add_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -> Tuple[bool, str]:
+    """
+    Add a new prompt to the library.
+    Returns (success, message).
+    """
+    valid, msg = _validate_prompt_name(name)
+    if not valid:
+        return False, msg
+    
+    if not content or not content.strip():
+        return False, "提示內容不能為空"
+    
+    if name in prompts:
+        return False, f"提示 '{name}' 已存在"
+    
+    # Write content file first
+    if not _write_prompt_content(name, content):
+        return False, "儲存內容失敗"
+    
+    prompts[name] = {
+        "content": content,
+        "protected": False
+    }
+    
+    if _save_metadata(prompts):
+        return True, f"已新增提示 '{name}'"
+    else:
+        # Rollback: remove the content file and dict entry
+        _delete_prompt_file(name)
+        del prompts[name]
+        return False, "儲存失敗"
+
+def update_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -> Tuple[bool, str]:
+    """
+    Update an existing prompt's content (if not protected).
+    Returns (success, message).
+    """
+    if name not in prompts:
+        return False, f"提示 '{name}' 不存在"
+    
+    if prompts[name].get("protected", False):
+        return False, f"提示 '{name}' 受保護，無法編輯"
+    
+    if not content or not content.strip():
+        return False, "提示內容不能為空"
+    
+    original_content = prompts[name]["content"]
+    
+    if not _write_prompt_content(name, content):
+        return False, "儲存內容失敗"
+    
+    prompts[name]["content"] = content
+    return True, f"已更新提示 '{name}'"
+
+def delete_prompt(prompts: Dict[str, Dict[str, Any]], name: str) -> Tuple[bool, str]:
+    """
+    Delete a prompt (if not protected).
+    Returns (success, message).
+    """
+    if name not in prompts:
+        return False, f"提示 '{name}' 不存在"
+    
+    if prompts[name].get("protected", False):
+        return False, f"提示 '{name}' 受保護，無法刪除"
+    
+    deleted_data = prompts.pop(name)
+    
+    if _save_metadata(prompts):
+        _delete_prompt_file(name)
+        return True, f"已刪除提示 '{name}'"
+    else:
+        prompts[name] = deleted_data
+        return False, "儲存失敗"
+
 def get_openrouter_client(api_key: str) -> OpenAI:
     return OpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -48,7 +226,6 @@ def check_api_credits(api_key: str) -> Optional[Dict]:
     Check OpenRouter API key credits.
     Returns dict with credit info or None if failed.
     """
-    import requests
     try:
         response = requests.get(
             "https://openrouter.ai/api/v1/auth/key",
@@ -127,31 +304,36 @@ def proofread_chunk_with_retry(
     chunk_info: str = "",
     max_retries: int = 3,
     initial_delay: float = 1.0
-) -> Optional[ProofreadingResponse]:
+) -> Tuple[Optional[ProofreadingResponse], List[str]]:
     """
     Wrapper function that retries chunk processing with exponential backoff.
+    Returns (result, warnings) tuple. Warnings are collected instead of calling
+    st.warning() directly, since this function may run in worker threads where
+    Streamlit calls are not thread-safe.
     """
+    warnings = []
     for attempt in range(max_retries):
         try:
             result = proofread_chunk_with_llm(client, model, chunk_text, system_prompt, chunk_info)
             if result is not None:
-                return result
+                return result, warnings
             
             # If result is None but no exception, still retry
             if attempt < max_retries - 1:
                 delay = initial_delay * (2 ** attempt)
+                warnings.append(f"Retry {attempt + 1}/{max_retries} for {chunk_info}: got None result (waiting {delay}s)")
                 time.sleep(delay)
                 
         except Exception as e:
             if attempt < max_retries - 1:
                 delay = initial_delay * (2 ** attempt)
-                st.warning(f"Retry {attempt + 1}/{max_retries} for {chunk_info} after error: {str(e)[:100]}... (waiting {delay}s)")
+                warnings.append(f"Retry {attempt + 1}/{max_retries} for {chunk_info} after error: {str(e)[:100]}... (waiting {delay}s)")
                 time.sleep(delay)
             else:
-                st.error(f"Failed {chunk_info} after {max_retries} attempts: {str(e)}")
-                return None
+                warnings.append(f"Failed {chunk_info} after {max_retries} attempts: {str(e)}")
+                return None, warnings
     
-    return None
+    return None, warnings
 
 def chunk_paragraphs(rdoc: RevisionDocument, chunk_size: int = 100, process_percentage: int = 100) -> List[Tuple[int, int, str]]:
     """
@@ -279,7 +461,6 @@ Respond with valid JSON only."""
         )
     except Exception as e:
         st.error(f"Error calling LLM: {str(e)}")
-        import traceback
         with st.expander("🔍 Full Error Details", expanded=False):
             st.code(traceback.format_exc())
         return None
@@ -338,6 +519,7 @@ def proofread_with_llm(
         
         # Collect results as they complete
         chunk_results = {}
+        all_warnings = []
         for future in as_completed(future_to_chunk):
             chunk_idx, start_idx, end_idx = future_to_chunk[future]
             completed_chunks += 1
@@ -345,13 +527,18 @@ def proofread_with_llm(
             status_text.text(f"Completed {completed_chunks}/{total_chunks} chunks (latest: paragraphs {start_idx}-{end_idx})...")
             
             try:
-                result = future.result()
+                result, warnings = future.result()
+                all_warnings.extend(warnings)
                 if result:
                     chunk_results[chunk_idx] = result
             except Exception as e:
-                st.warning(f"Error processing chunk {chunk_idx + 1}: {str(e)}")
+                all_warnings.append(f"Error processing chunk {chunk_idx + 1}: {str(e)}")
             
             progress_bar.progress(completed_chunks / total_chunks)
+    
+    # Display collected warnings from the main thread (thread-safe)
+    for warning_msg in all_warnings:
+        st.warning(warning_msg)
     
     # Combine results in order
     for chunk_idx in sorted(chunk_results.keys()):
@@ -427,8 +614,7 @@ def apply_tracked_changes(
                 pass
             else:
                 # Try fuzzy matching - check if texts are very similar
-                from difflib import SequenceMatcher
-                similarity = SequenceMatcher(None, current_text.strip(), edit.original_text.strip()).ratio()
+                similarity = difflib.SequenceMatcher(None, current_text.strip(), edit.original_text.strip()).ratio()
                 
                 if similarity >= SIMILARITY_THRESHOLD:
                     # Close enough - likely just minor character encoding differences
@@ -524,6 +710,13 @@ def main():
     st.title("📝 紅出版 Word AI校對工具")
     st.markdown("上傳 Word 文件，讓 AI 進行校對並以追蹤修訂模式標記修改")
     
+    # Load prompts
+    if 'prompts' not in st.session_state:
+        st.session_state.prompts = load_prompts()
+    
+    prompts = st.session_state.prompts
+    prompt_names = list(prompts.keys())
+    
     with st.sidebar:
         st.header("⚙️ 設定")
         
@@ -535,8 +728,18 @@ def main():
         
         # Show API credits if key is entered
         if api_key:
-            with st.spinner("檢查 API 額度..."):
-                credits_info = check_api_credits(api_key)
+            # Only re-check credits when API key changes or on first load
+            need_check = False
+            if 'cached_api_key' not in st.session_state or st.session_state.cached_api_key != api_key:
+                need_check = True
+            
+            if need_check:
+                with st.spinner("檢查 API 額度..."):
+                    credits_info = check_api_credits(api_key)
+                st.session_state.cached_api_key = api_key
+                st.session_state.cached_credits_info = credits_info
+            else:
+                credits_info = st.session_state.get('cached_credits_info')
             
             if credits_info and 'data' in credits_info:
                 data = credits_info['data']
@@ -575,13 +778,202 @@ def main():
             help="顯示在追蹤修訂中的名稱"
         )
         
-        with st.expander("📋 自訂系統提示", expanded=False):
-            system_prompt = st.text_area(
-                "系統提示",
-                value=DEFAULT_SYSTEM_PROMPT,
-                height=300,
-                help="自訂校對指令"
+        # ============================================================
+        # Prompt Management
+        # ============================================================
+        st.markdown("---")
+        st.subheader("📋 校對提示")
+        
+        # Initialize mode state
+        if 'creating_new_prompt' not in st.session_state:
+            st.session_state.creating_new_prompt = False
+        
+        # Mode toggle button
+        if not st.session_state.creating_new_prompt:
+            if st.button("➕ 新增提示", use_container_width=True, type="secondary"):
+                st.session_state.creating_new_prompt = True
+                st.session_state.new_prompt_name_input = ""
+                st.session_state.confirm_delete_target = None
+                st.rerun()
+        else:
+            if st.button("⬅️ 返回", use_container_width=True, type="secondary"):
+                st.session_state.creating_new_prompt = False
+                st.session_state.confirm_delete_target = None
+                st.rerun()
+        
+        # ============================================================
+        # NEW PROMPT MODE
+        # ============================================================
+        if st.session_state.creating_new_prompt:
+            st.info("🆕 新增模式：輸入名稱並編輯內容")
+            
+            # New prompt name input
+            new_prompt_name = st.text_input(
+                "新提示名稱",
+                value=st.session_state.get('new_prompt_name_input', ''),
+                key="new_prompt_name"
             )
+            
+            # Template selector - use existing prompts as templates
+            template_options = ["(空白)"] + list(prompts.keys())
+            
+            def on_template_change():
+                selected = st.session_state.template_selector
+                if selected != "(空白)":
+                    st.session_state.new_prompt_content = prompts[selected]["content"]
+            
+            selected_template = st.selectbox(
+                "從範本開始",
+                options=template_options,
+                key="template_selector",
+                on_change=on_template_change
+            )
+            
+            # Reuse the textarea UI for new prompt content
+            new_prompt_content = st.text_area(
+                "提示內容",
+                value="",
+                height=250,
+                help="編輯新提示的內容",
+                key="new_prompt_content"
+            )
+            
+            # Create button
+            if st.button("💾 建立提示", use_container_width=True, type="secondary", key="create_new"):
+                if not new_prompt_name or not new_prompt_name.strip():
+                    st.error("請輸入提示名稱")
+                elif not new_prompt_content or not new_prompt_content.strip():
+                    st.error("請輸入提示內容")
+                else:
+                    success, message = add_prompt(prompts, new_prompt_name, new_prompt_content)
+                    if success:
+                        st.success(message)
+                        st.session_state.prompts = load_prompts()
+                        st.session_state.creating_new_prompt = False
+                        # Store the newly created prompt name to auto-select it
+                        st.session_state.newly_created_prompt = new_prompt_name
+                        st.session_state.confirm_delete_target = None
+                        st.rerun()
+                    else:
+                        st.error(message)
+            
+            # Use empty content for system prompt in new mode
+            system_prompt = new_prompt_content
+        
+        # ============================================================
+        # EDIT EXISTING PROMPT MODE
+        # ============================================================
+        else:
+            # If we need to change the selectbox value, do it BEFORE the widget renders
+            if 'newly_created_prompt' in st.session_state:
+                st.session_state.prompt_selector = st.session_state.newly_created_prompt
+                del st.session_state.newly_created_prompt
+            
+            if 'reset_prompt_selector' in st.session_state:
+                st.session_state.prompt_selector = st.session_state.reset_prompt_selector
+                del st.session_state.reset_prompt_selector
+            
+            # Callback when user changes selection - clear delete confirmation
+            def on_selector_change():
+                st.session_state.confirm_delete_target = None
+            
+            # Prompt selector - controlled via key "prompt_selector"
+            selected_prompt_name = st.selectbox(
+                "選擇提示",
+                options=prompt_names,
+                key="prompt_selector",
+                on_change=on_selector_change,
+                help="選擇要使用的提示範本"
+            )
+            
+            # Get selected prompt details
+            selected_prompt_data = prompts[selected_prompt_name]
+            is_protected = selected_prompt_data.get("protected", False)
+            original_content = selected_prompt_data["content"]
+            
+            # Callback to track content changes
+            def on_prompt_change():
+                st.session_state.prompt_modified = True
+            
+            # Prompt content textarea (read-only for protected prompts)
+            current_prompt_content = st.text_area(
+                "提示內容",
+                value=original_content,
+                height=250,
+                help="此提示受保護，無法編輯" if is_protected else "編輯提示內容",
+                key=f"prompt_content_{selected_prompt_name}",
+                disabled=is_protected,
+                on_change=on_prompt_change
+            )
+            
+            if is_protected:
+                st.caption("🔒 此提示受保護，無法儲存修改或刪除")
+            
+            # Check if content has been modified
+            content_modified = current_prompt_content != original_content
+            
+            # Save button - only enabled when content is modified and not protected
+            save_disabled = is_protected or not content_modified
+            if st.button(
+                f"💾 儲存",
+                disabled=save_disabled,
+                use_container_width=True,
+                key="save_current",
+                type="primary" if content_modified and not is_protected else "secondary"
+            ):
+                success, message = update_prompt(prompts, selected_prompt_name, current_prompt_content)
+                if success:
+                    st.success(message)
+                    st.session_state.prompts = load_prompts()
+                    st.session_state.prompt_modified = False
+                    st.rerun()
+                else:
+                    st.error(message)
+            
+            # Delete button with confirmation
+            delete_disabled = is_protected
+            
+            # Initialize confirmation state
+            if 'confirm_delete_target' not in st.session_state:
+                st.session_state.confirm_delete_target = None
+            
+            # Check if we're confirming deletion for the currently selected prompt
+            is_confirming = st.session_state.confirm_delete_target == selected_prompt_name
+            
+            if not is_confirming:
+                if st.button(
+                    f"🗑️ 刪除",
+                    disabled=delete_disabled,
+                    use_container_width=True,
+                    key="delete_current"
+                ):
+                    st.session_state.confirm_delete_target = selected_prompt_name
+                    st.rerun()
+            else:
+                st.warning(f"⚠️ 確定要刪除 '{selected_prompt_name}' 嗎？")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("✅ 確認刪除", use_container_width=True, type="primary", key="confirm_delete_yes"):
+                        success, message = delete_prompt(prompts, selected_prompt_name)
+                        if success:
+                            st.success(message)
+                            st.session_state.prompts = load_prompts()
+                            st.session_state.confirm_delete_target = None
+                            # Schedule selector reset for next rerun (can't modify after widget renders)
+                            st.session_state.reset_prompt_selector = prompt_names[0]
+                            st.rerun()
+                        else:
+                            st.error(message)
+                            st.session_state.confirm_delete_target = None
+                
+                with col2:
+                    if st.button("❌ 取消", use_container_width=True, key="confirm_delete_no"):
+                        st.session_state.confirm_delete_target = None
+                        st.rerun()
+            
+            # Set the system prompt to use (use current edited content)
+            system_prompt = current_prompt_content
         
         st.markdown("---")
         
@@ -611,9 +1003,10 @@ def main():
             st.warning("⚠️ 請在側邊欄輸入您的 OpenRouter API 金鑰")
             return
         
+        tmp_input_path = None
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_input:
-            tmp_input.write(uploaded_file.read())
             tmp_input_path = tmp_input.name
+            tmp_input.write(uploaded_file.read())
         
         try:
             with st.spinner("📖 讀取文件中..."):
@@ -843,7 +1236,7 @@ def main():
         except Exception as e:
             st.error(f"❌ 處理文件時發生錯誤：{str(e)}")
         finally:
-            if os.path.exists(tmp_input_path):
+            if tmp_input_path and os.path.exists(tmp_input_path):
                 os.unlink(tmp_input_path)
     else:        
         
