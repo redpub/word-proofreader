@@ -8,7 +8,7 @@ POPULAR_MODELS = [
     "x-ai/grok-4.1-fast",
     "z-ai/glm-4.5",
     "z-ai/glm-4.5-air",
-    "google/gemini-3.1-pro-preview"
+    "deepseek/deepseek-v3.2"
 ]
 
 # Processing configuration
