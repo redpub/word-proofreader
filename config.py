@@ -8,7 +8,7 @@ POPULAR_MODELS = [
     "x-ai/grok-4.1-fast",
     "z-ai/glm-4.5",
     "z-ai/glm-4.5-air",
-    "deepseek/deepseek-v3.2"
+    "qwen/qwen3.5-flash-02-23"
 ]
 
 # Processing configuration
