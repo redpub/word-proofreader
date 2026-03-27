@@ -22,3 +22,4 @@ gatherUsageStats = false
 # Client configuration
 showErrorDetails = true
 toolbarMode = "minimal"
+

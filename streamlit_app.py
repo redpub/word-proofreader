@@ -1,11 +1,11 @@
 import streamlit as st
 import tempfile
-import os
 import json
 import difflib
 import time
 import re
 import traceback
+import hashlib
 import requests
 from collections import OrderedDict
 from typing import Any, List, Dict, Optional, Tuple
@@ -13,15 +13,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from docx_revisions import RevisionDocument, RevisionParagraph
 from pydantic import BaseModel
+from supabase import create_client, Client
 from config import (
-    PROMPTS_FILE_PATH,
-    PROMPTS_DIR,
     POPULAR_MODELS,
     DEFAULT_CHUNK_SIZE,
+    MAX_CHUNK_SIZE,
     DEFAULT_MAX_WORKERS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_DELAY,
-    SIMILARITY_THRESHOLD,
+    TOKEN_CUSHION_FACTOR,
+    TOKENS_PER_CHAR_ESTIMATE,
+    PROMPT_TEMPLATE_OVERHEAD,
+    MIN_COMPLETION_RESERVE,
     DEFAULT_PARAGRAPHS_PER_PAGE,
     DEFAULT_EDITS_PER_PAGE
 )
@@ -34,116 +37,80 @@ st.set_page_config(
 
 class Edit(BaseModel):
     paragraph_index: int
-    original_text: str
     corrected_text: str
     reason: str
+
+def compute_paragraph_hash(text: str) -> str:
+    """Compute a short hash of paragraph text for verification."""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
 
 class ProofreadingResponse(BaseModel):
     edits: List[Edit]
     summary: str
 
 # ============================================================================
-# Prompt Management Functions
+# Prompt Management Functions (Supabase)
 # ============================================================================
 
-def _prompt_file_path(name: str) -> str:
-    """Return the .txt file path for a prompt's content."""
-    return os.path.join(PROMPTS_DIR, f"{name}.txt")
-
-def _read_prompt_content(name: str) -> str:
-    """Read prompt content from its .txt file."""
-    path = _prompt_file_path(name)
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return f.read()
-    return ""
-
-def _write_prompt_content(name: str, content: str) -> bool:
-    """Write prompt content to its .txt file."""
-    try:
-        os.makedirs(PROMPTS_DIR, exist_ok=True)
-        with open(_prompt_file_path(name), 'w', encoding='utf-8') as f:
-            f.write(content)
-        return True
-    except Exception:
-        return False
-
-def _delete_prompt_file(name: str) -> bool:
-    """Delete a prompt's .txt file."""
-    path = _prompt_file_path(name)
-    if os.path.exists(path):
-        os.unlink(path)
-    return True
-
-def _save_metadata(prompts: Dict[str, Dict[str, Any]]) -> bool:
-    """Save prompt metadata (without content) to prompts.json."""
-    try:
-        metadata = {
-            "prompts": {
-                name: {"protected": data.get("protected", False)}
-                for name, data in prompts.items()
-            }
-        }
-        with open(PROMPTS_FILE_PATH, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        st.error(f"無法儲存提示：{str(e)}")
-        return False
+@st.cache_resource
+def get_supabase_client() -> Client:
+    """Initialize and cache the Supabase client."""
+    url = st.secrets["connections"]["supabase"]["SUPABASE_URL"]
+    key = st.secrets["connections"]["supabase"]["SUPABASE_KEY"]
+    return create_client(url, key)
 
 def load_prompts() -> Dict[str, Dict[str, Any]]:
     """
-    Load prompts from prompts.json (metadata) + prompts/*.txt (content).
+    Load prompts from Supabase.
     Returns ordered dict with default prompt first.
     """
-    prompts = OrderedDict()
-    
-    if not os.path.exists(PROMPTS_FILE_PATH):
-        st.error(f"無法載入提示檔案：{PROMPTS_FILE_PATH} 不存在")
-        st.stop()
-    
     try:
-        with open(PROMPTS_FILE_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            loaded_prompts = data.get('prompts', {})
-            
-            # Ensure default prompt is first
-            default_name = "預設"
-            if default_name in loaded_prompts:
-                prompts[default_name] = loaded_prompts[default_name]
-                prompts[default_name]["content"] = _read_prompt_content(default_name)
-            
-            # Add other prompts
-            for name, prompt_data in loaded_prompts.items():
-                if name != default_name:
-                    prompts[name] = prompt_data
-                    prompts[name]["content"] = _read_prompt_content(name)
+        supabase = get_supabase_client()
+        response = supabase.table("prompts").select("name, content, is_protected").order("created_at").execute()
+        
+        prompts = OrderedDict()
+        default_name = "預設"
+        
+        # Put default prompt first
+        for row in response.data:
+            if row["name"] == default_name:
+                prompts[default_name] = {
+                    "content": row["content"],
+                    "protected": row["is_protected"],
+                }
+                break
+        
+        # Add remaining prompts
+        for row in response.data:
+            if row["name"] != default_name:
+                prompts[row["name"]] = {
+                    "content": row["content"],
+                    "protected": row["is_protected"],
+                }
+        
+        if not prompts:
+            st.error("無法載入提示：資料庫中無提示資料")
+            st.stop()
+        
+        return prompts
     except Exception as e:
-        st.warning(f"無法載入提示檔案：{str(e)}")
-    
-    if not prompts:
-        st.error(f"無法載入提示檔案：{PROMPTS_FILE_PATH} 為空")
+        st.error(f"無法載入提示：{str(e)}")
         st.stop()
-    
-    return prompts
 
-_INVALID_PROMPT_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f.]')
 _MAX_PROMPT_NAME_LENGTH = 50
 
 def _validate_prompt_name(name: str) -> Tuple[bool, str]:
-    """Validate that a prompt name is safe for use as a filename."""
+    """Validate prompt name."""
     name = name.strip()
     if not name:
         return False, "提示名稱不能為空"
     if len(name) > _MAX_PROMPT_NAME_LENGTH:
         return False, f"提示名稱不能超過 {_MAX_PROMPT_NAME_LENGTH} 個字元"
-    if _INVALID_PROMPT_NAME_CHARS.search(name):
-        return False, "提示名稱不能包含特殊字元（\\ / : * ? \" < > | .）"
     return True, ""
 
 def add_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -> Tuple[bool, str]:
     """
-    Add a new prompt to the library.
+    Add a new prompt to Supabase.
     Returns (success, message).
     """
     valid, msg = _validate_prompt_name(name)
@@ -156,26 +123,20 @@ def add_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -> T
     if name in prompts:
         return False, f"提示 '{name}' 已存在"
     
-    # Write content file first
-    if not _write_prompt_content(name, content):
-        return False, "儲存內容失敗"
-    
-    prompts[name] = {
-        "content": content,
-        "protected": False
-    }
-    
-    if _save_metadata(prompts):
+    try:
+        supabase = get_supabase_client()
+        supabase.table("prompts").insert({
+            "name": name,
+            "content": content,
+            "is_protected": False,
+        }).execute()
         return True, f"已新增提示 '{name}'"
-    else:
-        # Rollback: remove the content file and dict entry
-        _delete_prompt_file(name)
-        del prompts[name]
-        return False, "儲存失敗"
+    except Exception as e:
+        return False, f"儲存失敗：{str(e)}"
 
 def update_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -> Tuple[bool, str]:
     """
-    Update an existing prompt's content (if not protected).
+    Update an existing prompt's content in Supabase (if not protected).
     Returns (success, message).
     """
     if name not in prompts:
@@ -187,17 +148,18 @@ def update_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -
     if not content or not content.strip():
         return False, "提示內容不能為空"
     
-    original_content = prompts[name]["content"]
-    
-    if not _write_prompt_content(name, content):
-        return False, "儲存內容失敗"
-    
-    prompts[name]["content"] = content
-    return True, f"已更新提示 '{name}'"
+    try:
+        supabase = get_supabase_client()
+        supabase.table("prompts").update({
+            "content": content,
+        }).eq("name", name).execute()
+        return True, f"已更新提示 '{name}'"
+    except Exception as e:
+        return False, f"儲存失敗：{str(e)}"
 
 def delete_prompt(prompts: Dict[str, Dict[str, Any]], name: str) -> Tuple[bool, str]:
     """
-    Delete a prompt (if not protected).
+    Delete a prompt from Supabase (if not protected).
     Returns (success, message).
     """
     if name not in prompts:
@@ -206,14 +168,12 @@ def delete_prompt(prompts: Dict[str, Dict[str, Any]], name: str) -> Tuple[bool, 
     if prompts[name].get("protected", False):
         return False, f"提示 '{name}' 受保護，無法刪除"
     
-    deleted_data = prompts.pop(name)
-    
-    if _save_metadata(prompts):
-        _delete_prompt_file(name)
+    try:
+        supabase = get_supabase_client()
+        supabase.table("prompts").delete().eq("name", name).execute()
         return True, f"已刪除提示 '{name}'"
-    else:
-        prompts[name] = deleted_data
-        return False, "儲存失敗"
+    except Exception as e:
+        return False, f"刪除失敗：{str(e)}"
 
 def get_openrouter_client(api_key: str) -> OpenAI:
     return OpenAI(
@@ -237,6 +197,100 @@ def check_api_credits(api_key: str) -> Optional[Dict]:
         return None
     except Exception:
         return None
+
+def fetch_model_info(api_key: str, model_id: str) -> Optional[Dict]:
+    """
+    Fetch model metadata from OpenRouter API.
+    Returns dict with context_length, max_completion_tokens, etc. or None if failed.
+    """
+    try:
+        response = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10
+        )
+        if response.status_code != 200:
+            return None
+        
+        data = response.json()
+        for model in data.get("data", []):
+            if model.get("id") == model_id:
+                return {
+                    "id": model["id"],
+                    "name": model.get("name", model_id),
+                    "context_length": model.get("context_length", 0),
+                    "max_completion_tokens": model.get("top_provider", {}).get("max_completion_tokens", 0),
+                    "tokenizer": model.get("architecture", {}).get("tokenizer", "unknown"),
+                }
+        return None
+    except Exception:
+        return None
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate token count for a string using a conservative CJK-aware heuristic.
+    CJK characters typically map to 1-2 tokens; ASCII words ~1 token per 4 chars.
+    We use a single conservative multiplier for safety.
+    """
+    return int(len(text) * TOKENS_PER_CHAR_ESTIMATE)
+
+def compute_dynamic_chunk_size(
+    rdoc: RevisionDocument,
+    system_prompt: str,
+    context_length: int,
+    max_completion_tokens: int,
+    process_percentage: int = 100
+) -> int:
+    """
+    Compute optimal paragraphs-per-chunk based on model token limits.
+    
+    Budget: context_length - completion_reserve - system_prompt_tokens - prompt_overhead
+    Then apply cushion factor and divide by average tokens per paragraph.
+    Falls back to DEFAULT_CHUNK_SIZE if computation yields unreasonable results.
+    """
+    # Reserve tokens for the LLM's response
+    completion_reserve = max(max_completion_tokens, MIN_COMPLETION_RESERVE)
+    
+    # Estimate system prompt tokens
+    system_prompt_tokens = estimate_tokens(system_prompt)
+    
+    # Available tokens for paragraph content in the user prompt
+    available = context_length - completion_reserve - system_prompt_tokens - PROMPT_TEMPLATE_OVERHEAD
+    safe_budget = int(available * TOKEN_CUSHION_FACTOR)
+    
+    if safe_budget <= 0:
+        return DEFAULT_CHUNK_SIZE
+    
+    # Estimate average tokens per paragraph from the actual document
+    total_paragraphs = len(rdoc.paragraphs)
+    paragraphs_to_process = max(1, int(total_paragraphs * process_percentage / 100))
+    
+    # Sample up to 200 paragraphs to get average size (avoid scanning huge documents fully)
+    sample_size = min(paragraphs_to_process, 200)
+    total_chars = 0
+    for i in range(sample_size):
+        text = rdoc.paragraphs[i].text.strip()
+        if text:
+            # Account for the "[index|hash] " prefix (~15 chars overhead per line)
+            total_chars += len(text) + 15
+        else:
+            # Empty paragraph marker
+            total_chars += 25
+    
+    if total_chars == 0:
+        return DEFAULT_CHUNK_SIZE
+    
+    avg_tokens_per_para = int((total_chars / sample_size) * TOKENS_PER_CHAR_ESTIMATE)
+    
+    if avg_tokens_per_para <= 0:
+        return DEFAULT_CHUNK_SIZE
+    
+    chunk_size = int(safe_budget / avg_tokens_per_para)
+    
+    # Clamp to reasonable bounds
+    chunk_size = max(10, min(chunk_size, MAX_CHUNK_SIZE))
+    
+    return chunk_size
 
 def check_for_tracked_changes(rdoc: RevisionDocument) -> Tuple[bool, int]:
     """
@@ -303,7 +357,8 @@ def proofread_chunk_with_retry(
     system_prompt: str,
     chunk_info: str = "",
     max_retries: int = 3,
-    initial_delay: float = 1.0
+    initial_delay: float = 1.0,
+    max_completion_tokens: Optional[int] = None
 ) -> Tuple[Optional[ProofreadingResponse], List[str]]:
     """
     Wrapper function that retries chunk processing with exponential backoff.
@@ -314,23 +369,24 @@ def proofread_chunk_with_retry(
     warnings = []
     for attempt in range(max_retries):
         try:
-            result = proofread_chunk_with_llm(client, model, chunk_text, system_prompt, chunk_info)
+            result, chunk_warnings = proofread_chunk_with_llm(client, model, chunk_text, system_prompt, chunk_info, max_completion_tokens=max_completion_tokens)
+            warnings.extend(chunk_warnings)
             if result is not None:
                 return result, warnings
             
             # If result is None but no exception, still retry
             if attempt < max_retries - 1:
                 delay = initial_delay * (2 ** attempt)
-                warnings.append(f"Retry {attempt + 1}/{max_retries} for {chunk_info}: got None result (waiting {delay}s)")
+                warnings.append(f"重試 {attempt + 1}/{max_retries}{chunk_info}：未取得結果（等待 {delay} 秒）")
                 time.sleep(delay)
                 
         except Exception as e:
             if attempt < max_retries - 1:
                 delay = initial_delay * (2 ** attempt)
-                warnings.append(f"Retry {attempt + 1}/{max_retries} for {chunk_info} after error: {str(e)[:100]}... (waiting {delay}s)")
+                warnings.append(f"重試 {attempt + 1}/{max_retries}{chunk_info} 發生錯誤：{str(e)[:100]}...（等待 {delay} 秒）")
                 time.sleep(delay)
             else:
-                warnings.append(f"Failed {chunk_info} after {max_retries} attempts: {str(e)}")
+                warnings.append(f"失敗{chunk_info}，已重試 {max_retries} 次：{str(e)}")
                 return None, warnings
     
     return None, warnings
@@ -361,7 +417,8 @@ def chunk_paragraphs(rdoc: RevisionDocument, chunk_size: int = 100, process_perc
         for i in range(start_idx, end_idx):
             text = rdoc.paragraphs[i].text.strip()
             if text:
-                lines.append(f"[{i}] {text}")
+                h = compute_paragraph_hash(text)
+                lines.append(f"[{i}|{h}] {text}")
             else:
                 # Include empty paragraphs to maintain correct indexing
                 lines.append(f"[{i}] (empty paragraph)")
@@ -376,8 +433,16 @@ def proofread_chunk_with_llm(
     model: str,
     chunk_text: str,
     system_prompt: str,
-    chunk_info: str = ""
-) -> Optional[ProofreadingResponse]:
+    chunk_info: str = "",
+    max_completion_tokens: Optional[int] = None
+) -> Tuple[Optional[ProofreadingResponse], List[str]]:
+    """
+    Process a single chunk with the LLM.
+    Returns (result, warnings) tuple. Warnings are collected instead of calling
+    st.*() directly, since this function may run in worker threads where
+    Streamlit calls are not thread-safe.
+    """
+    warnings = []
     try:
         user_prompt = f"""Here is the document chunk to proofread{chunk_info}:
 
@@ -390,106 +455,134 @@ IMPORTANT: Your response must be VALID JSON only, with no additional text before
     "edits": [
         {{
             "paragraph_index": 0,
-            "original_text": "the complete original paragraph text",
             "corrected_text": "the complete corrected paragraph text",
             "reason": "why this change improves the text"
         }}
     ],
-    "summary": "Brief summary of all changes made"
+    "summary": "所有修改的簡短摘要（繁體中文）"
 }}
 
 RULES:
-1. For each edit, provide the COMPLETE paragraph text in both original_text and corrected_text
-2. This allows us to compute precise character-level differences for tracked changes
-3. Only include paragraphs that need corrections
-4. SKIP paragraphs marked as "(empty paragraph)" - do not suggest edits for them
-5. The paragraph_index should be the number shown in brackets [n]
-6. The original_text should contain ONLY the text AFTER the [n] bracket, NOT the bracket itself
-7. The original_text must EXACTLY match the paragraph content character-for-character (no paraphrasing)
-8. Ensure all strings are properly escaped for JSON (escape quotes, newlines, etc.)
-9. If no corrections are needed, return: {{"edits": [], "summary": "No corrections needed"}}
+1. Each paragraph is shown as [index|hash] text. Return the paragraph_index (the number before the |) for each edit.
+2. Provide the COMPLETE corrected paragraph text in corrected_text (the full paragraph with your corrections applied).
+3. Only include paragraphs that need corrections.
+4. SKIP paragraphs marked as "(empty paragraph)" - do not suggest edits for them.
+5. The corrected_text should contain ONLY the corrected text, NOT the [index|hash] prefix.
+6. Ensure all strings are properly escaped for JSON (escape quotes, newlines, etc.)
+7. If no corrections are needed, return: {{"edits": [], "summary": "無需修正"}}
+8. The "summary" and "reason" fields MUST be written in Traditional Chinese (繁體中文).
 
 EXAMPLE:
-Input: "[102] 對於我來説，語文很難。"
+Input: "[102|a3f9b2c1] 對於我來説，語文很難。"
 Correct JSON:
 {{
     "paragraph_index": 102,
-    "original_text": "對於我來説，語文很難。",
     "corrected_text": "對於我來說，語文很難。",
-    "reason": "Corrected '説' to '說'"
+    "reason": "將「説」修正為「說」"
 }}
 
 Respond with valid JSON only."""
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
+        create_kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3,
-            response_format={"type": "json_object"}
-        )
+            "temperature": 0.3,
+            "response_format": {"type": "json_object"}
+        }
+        if max_completion_tokens:
+            create_kwargs["max_tokens"] = max_completion_tokens
+        
+        response = client.chat.completions.create(**create_kwargs)
         
         content = response.choices[0].message.content
+        
+        if not content:
+            # Gather diagnostic info from the response
+            choice = response.choices[0] if response.choices else None
+            diag = {
+                "finish_reason": getattr(choice, "finish_reason", None) if choice else None,
+                "refusal": getattr(choice.message, "refusal", None) if choice else None,
+                "model": getattr(response, "model", None),
+                "usage": getattr(response, "usage", None),
+            }
+            warnings.append(f"LLM 回傳空白回應{chunk_info}。診斷資訊：{diag}")
+            return None, warnings
+        
+        # Check for truncation before parsing
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason == "length":
+            warnings.append(f"LLM 回應被截斷（finish_reason=length）{chunk_info}。"
+                            f"區塊可能超出模型的輸出上限。")
+            return None, warnings
         
         try:
             data = json.loads(content)
         except json.JSONDecodeError as je:
-            st.error(f"Failed to parse LLM response as JSON: {str(je)}")
-            with st.expander("🔍 Raw LLM Response", expanded=False):
-                st.code(content, language="json")
-            return None
+            warnings.append(f"無法解析 LLM 回應的 JSON{chunk_info}：{str(je)}")
+            return None, warnings
         
         if "edits" not in data:
-            st.warning("LLM response missing 'edits' field")
-            with st.expander("🔍 LLM Response", expanded=False):
-                st.json(data)
-            return ProofreadingResponse(edits=[], summary=data.get("summary", "No edits provided"))
+            warnings.append(f"LLM 回應缺少 'edits' 欄位{chunk_info}")
+            return ProofreadingResponse(edits=[], summary=data.get("summary", "未提供修改")), warnings
         
         try:
             edits = [Edit(**edit) for edit in data.get("edits", [])]
         except Exception as validation_error:
-            st.error(f"Failed to validate edit data: {str(validation_error)}")
-            with st.expander("🔍 Edit Data", expanded=False):
-                st.json(data.get("edits", []))
-            return None
+            warnings.append(f"驗證修改資料失敗{chunk_info}：{str(validation_error)}")
+            return None, warnings
         
         return ProofreadingResponse(
             edits=edits,
-            summary=data.get("summary", "No changes suggested.")
-        )
+            summary=data.get("summary", "無需修正。")
+        ), warnings
     except Exception as e:
-        st.error(f"Error calling LLM: {str(e)}")
-        with st.expander("🔍 Full Error Details", expanded=False):
-            st.code(traceback.format_exc())
-        return None
+        warnings.append(f"呼叫 LLM 時發生錯誤{chunk_info}：{str(e)}")
+        return None, warnings
 
 def proofread_with_llm(
     client: OpenAI,
     model: str,
     rdoc: RevisionDocument,
     system_prompt: str,
-    chunk_size: int = 100,
     max_workers: int = 5,
-    process_percentage: int = 100
+    process_percentage: int = 100,
+    model_info: Optional[Dict] = None
 ) -> Optional[ProofreadingResponse]:
     """
     Proofread document in chunks using parallel processing.
+    Chunk size is computed dynamically from model token limits when model_info is available.
     """
     total_paragraphs = len(rdoc.paragraphs)
     paragraphs_to_process = max(1, int(total_paragraphs * process_percentage / 100))
+    
+    # Compute chunk size dynamically or fall back to default
+    if model_info and model_info.get("context_length", 0) > 0:
+        chunk_size = compute_dynamic_chunk_size(
+            rdoc, system_prompt,
+            model_info["context_length"],
+            model_info.get("max_completion_tokens", 0),
+            process_percentage
+        )
+        st.info(f"📐 動態區塊大小：{chunk_size} 個段落"
+                f"（模型上下文：{model_info['context_length']:,} tokens）")
+    else:
+        chunk_size = DEFAULT_CHUNK_SIZE
+        st.info(f"📐 使用預設區塊大小：{chunk_size} 個段落（無法取得模型資訊）")
     
     chunks = chunk_paragraphs(rdoc, chunk_size, process_percentage)
     total_chunks = len(chunks)
     
     if total_chunks == 0:
-        return ProofreadingResponse(edits=[], summary="Document is empty")
+        return ProofreadingResponse(edits=[], summary="文件為空")
     
     if process_percentage < 100:
-        st.info(f"🧪 Testing mode: Processing {process_percentage}% of document ({paragraphs_to_process}/{total_paragraphs} paragraphs)")
+        st.info(f"🧪 測試模式：處理文件的 {process_percentage}%（{paragraphs_to_process}/{total_paragraphs} 個段落）")
     
-    st.info(f"📦 Processing document in {total_chunks} chunks ({chunk_size} paragraphs per chunk) with {max_workers} parallel workers")
+    actual_workers = min(max_workers, total_chunks)
+    st.info(f"📦 將文件分為 {total_chunks} 個區塊（每區塊 {chunk_size} 個段落），使用 {actual_workers} 個平行工作執行緒")
     
     all_edits = []
     chunk_summaries = []
@@ -513,7 +606,8 @@ def proofread_with_llm(
                 system_prompt,
                 chunk_info,
                 max_retries=DEFAULT_MAX_RETRIES,
-                initial_delay=DEFAULT_RETRY_DELAY
+                initial_delay=DEFAULT_RETRY_DELAY,
+                max_completion_tokens=model_info.get("max_completion_tokens") if model_info else None
             )
             future_to_chunk[future] = (chunk_idx, start_idx, end_idx)
         
@@ -524,7 +618,7 @@ def proofread_with_llm(
             chunk_idx, start_idx, end_idx = future_to_chunk[future]
             completed_chunks += 1
             
-            status_text.text(f"Completed {completed_chunks}/{total_chunks} chunks (latest: paragraphs {start_idx}-{end_idx})...")
+            status_text.text(f"已完成 {completed_chunks}/{total_chunks} 個區塊（最新：段落 {start_idx}-{end_idx}）...")
             
             try:
                 result, warnings = future.result()
@@ -532,7 +626,7 @@ def proofread_with_llm(
                 if result:
                     chunk_results[chunk_idx] = result
             except Exception as e:
-                all_warnings.append(f"Error processing chunk {chunk_idx + 1}: {str(e)}")
+                all_warnings.append(f"處理區塊 {chunk_idx + 1} 時發生錯誤：{str(e)}")
             
             progress_bar.progress(completed_chunks / total_chunks)
     
@@ -544,16 +638,16 @@ def proofread_with_llm(
     for chunk_idx in sorted(chunk_results.keys()):
         result = chunk_results[chunk_idx]
         all_edits.extend(result.edits)
-        if result.summary and result.summary != "No changes suggested.":
-            chunk_summaries.append(f"Chunk {chunk_idx + 1}: {result.summary}")
+        if result.summary and result.summary != "無需修正。":
+            chunk_summaries.append(f"區塊 {chunk_idx + 1}：{result.summary}")
     
-    status_text.text("✅ All chunks processed!")
+    status_text.text("✅ 所有區塊處理完成！")
     
     # Combine summaries
     if chunk_summaries:
-        combined_summary = f"Processed {total_chunks} chunks in parallel. " + " | ".join(chunk_summaries)
+        combined_summary = f"已平行處理 {total_chunks} 個區塊。\n" + "\n".join(chunk_summaries)
     else:
-        combined_summary = f"Processed {total_chunks} chunks in parallel. No corrections needed."
+        combined_summary = f"已平行處理 {total_chunks} 個區塊，無需修正。"
     
     return ProofreadingResponse(
         edits=all_edits,
@@ -585,7 +679,7 @@ def apply_tracked_changes(
     rdoc: RevisionDocument,
     edits: List[Edit],
     author: str
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     stats = {
         "deletions": 0, 
         "insertions": 0, 
@@ -601,47 +695,18 @@ def apply_tracked_changes(
                     "paragraph_index": edit.paragraph_index,
                     "reason": "out_of_range",
                     "total_paragraphs": len(rdoc.paragraphs),
-                    "edit": edit
+                    "edit": edit.model_dump()
                 })
                 continue
             
             para_element = rdoc.paragraphs[edit.paragraph_index]
             current_text = para_element.text
             
-            # Check for exact match first
-            if current_text.strip() == edit.original_text.strip():
-                # Perfect match, proceed with edit
-                pass
-            else:
-                # Try fuzzy matching - check if texts are very similar
-                similarity = difflib.SequenceMatcher(None, current_text.strip(), edit.original_text.strip()).ratio()
-                
-                if similarity >= SIMILARITY_THRESHOLD:
-                    # Close enough - likely just minor character encoding differences
-                    # Use the actual document text as the original
-                    edit.original_text = current_text
-                else:
-                    # Significant mismatch - skip this edit
-                    stats["errors"] += 1
-                    stats["failed_edits"].append({
-                        "paragraph_index": edit.paragraph_index,
-                        "reason": "text_mismatch",
-                        "expected_text": edit.original_text,
-                        "actual_text": current_text,
-                        "actual_text_length": len(current_text),
-                        "expected_text_length": len(edit.original_text),
-                        "actual_text_stripped_length": len(current_text.strip()),
-                        "expected_text_stripped_length": len(edit.original_text.strip()),
-                        "similarity_ratio": similarity,
-                        "corrected_text": edit.corrected_text,
-                        "edit_reason": edit.reason,
-                        "first_50_chars_actual": current_text[:50] if current_text else "(empty)",
-                        "first_50_chars_expected": edit.original_text[:50] if edit.original_text else "(empty)"
-                    })
-                    continue
+            # Use the actual document text as the original for diffing
+            original_text = current_text
             
             rp = RevisionParagraph.from_paragraph(para_element)
-            diffs = compute_character_diffs(edit.original_text, edit.corrected_text)
+            diffs = compute_character_diffs(original_text, edit.corrected_text)
             
             # Process diffs in reverse order to maintain correct positions
             for op, start, end, text in reversed(diffs):
@@ -654,30 +719,30 @@ def apply_tracked_changes(
                     stats["deletions"] += 1
                     
                 elif op == 'insert':
-                    # For pure insertions, we need to insert at a position
-                    # Use replace_tracked_at with start==end to insert at that position
-                    if start == 0:
-                        # Insert at beginning - need special handling
-                        # Insert a zero-width replacement
-                        rp.replace_tracked_at(
-                            start=0,
-                            end=1 if len(edit.original_text) > 0 else 0,
-                            replace_text=text + (edit.original_text[0] if len(edit.original_text) > 0 else ""),
-                            author=author
-                        )
-                    elif start >= len(edit.original_text):
-                        # Insert at end - use add_tracked_insertion
+                    # For pure insertions, we need to insert at a position.
+                    # replace_tracked_at requires start < end, so we "borrow"
+                    # an adjacent character, delete it, and re-insert it
+                    # alongside the new text.
+                    if start >= len(original_text) or len(original_text) == 0:
+                        # Insert at end or into empty paragraph
                         rp.add_tracked_insertion(
                             text=text,
                             author=author
                         )
+                    elif start == 0:
+                        # Insert at beginning - borrow the first character
+                        rp.replace_tracked_at(
+                            start=0,
+                            end=1,
+                            replace_text=text + original_text[0],
+                            author=author
+                        )
                     else:
-                        # Insert in middle - replace zero-width span
-                        # We insert by replacing the character at position with itself + new text
+                        # Insert in middle - borrow the character at position
                         rp.replace_tracked_at(
                             start=start,
                             end=start + 1,
-                            replace_text=text + edit.original_text[start],
+                            replace_text=text + original_text[start],
                             author=author
                         )
                     stats["insertions"] += 1
@@ -699,7 +764,6 @@ def apply_tracked_changes(
                 "paragraph_index": edit.paragraph_index,
                 "reason": "exception",
                 "error_message": str(e),
-                "expected_text": edit.original_text,
                 "corrected_text": edit.corrected_text,
                 "edit_reason": edit.reason
             })
@@ -1045,7 +1109,7 @@ def main():
                     start_idx = (page - 1) * paragraphs_per_page
                     end_idx = min(start_idx + paragraphs_per_page, total_paragraphs)
                     
-                    st.caption(f"顯示第 {start_idx + 1}-{end_idx} 段，共 {total_paragraphs} 段")
+                    st.caption(f"顯示第 {start_idx + 1}-{end_idx} 行，共 {total_paragraphs} 行（非空段落）")
                     st.text('\n'.join(paragraphs_list[start_idx:end_idx]))
                 else:
                     st.text(document_text[:2000] + ("..." if len(document_text) > 2000 else ""))
@@ -1055,15 +1119,22 @@ def main():
             if st.button("🚀 開始校對", type="primary", use_container_width=True):
                 client = get_openrouter_client(api_key)
                 
+                # Fetch and cache model info for dynamic chunk sizing
+                cache_key = f"model_info_{model}"
+                if cache_key not in st.session_state:
+                    with st.spinner("📡 取得模型資訊..."):
+                        st.session_state[cache_key] = fetch_model_info(api_key, model)
+                model_info = st.session_state[cache_key]
+                
                 with st.spinner(f"🤖 使用 {model} 校對中..."):
                     result = proofread_with_llm(
                         client,
                         model,
                         rdoc,
                         system_prompt,
-                        chunk_size=DEFAULT_CHUNK_SIZE,
                         max_workers=DEFAULT_MAX_WORKERS,
-                        process_percentage=process_percentage
+                        process_percentage=process_percentage,
+                        model_info=model_info
                     )
                 
                 if result is None:
@@ -1106,15 +1177,18 @@ def main():
                     for i, edit in enumerate(edits_to_show, edit_offset + 1):
                         st.markdown(f"**修改 {i}** (段落 {edit.paragraph_index})")
                         
-                        diffs = compute_character_diffs(edit.original_text, edit.corrected_text)
+                        # Look up original text from document
+                        if 0 <= edit.paragraph_index < len(rdoc.paragraphs):
+                            original_text = rdoc.paragraphs[edit.paragraph_index].text
+                        else:
+                            original_text = "(段落索引超出範圍)"
                         
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown("**原文：**")
-                            st.code(edit.original_text, language=None)
-                        with col2:
-                            st.markdown("**修正後：**")
-                            st.code(edit.corrected_text, language=None)
+                        diffs = compute_character_diffs(original_text, edit.corrected_text)
+                        
+                        st.markdown("**原文：**")
+                        st.code(original_text, language=None)
+                        st.markdown("**修正後：**")
+                        st.code(edit.corrected_text, language=None)
                         
                         st.markdown("**字元級別修改：**")
                         for op, start, end, text in diffs:
@@ -1132,6 +1206,7 @@ def main():
                     stats = apply_tracked_changes(rdoc, result.edits, author_name)
                 
                 st.info(f"📊 已套用 {stats['deletions']} 個刪除和 {stats['insertions']} 個插入")
+                
                 if stats['errors'] > 0:
                     st.warning(f"⚠️ {stats['errors']} 個修改無法套用")
                     
@@ -1141,48 +1216,11 @@ def main():
                         st.caption(f"總失敗數：{len(stats['failed_edits'])}")
                         
                         # Group by failure reason
-                        mismatch_failures = [f for f in stats['failed_edits'] if f['reason'] == 'text_mismatch']
                         range_failures = [f for f in stats['failed_edits'] if f['reason'] == 'out_of_range']
                         exception_failures = [f for f in stats['failed_edits'] if f['reason'] == 'exception']
                         
-                        st.markdown(f"- **文字不符**：{len(mismatch_failures)}")
                         st.markdown(f"- **超出範圍**：{len(range_failures)}")
                         st.markdown(f"- **例外錯誤**：{len(exception_failures)}")
-                        
-                        # Show text mismatch details
-                        if mismatch_failures:
-                            st.markdown("---")
-                            st.markdown("### 📝 文字不符失敗")
-                            
-                            for i, failure in enumerate(mismatch_failures[:20], 1):  # Limit to first 20
-                                st.markdown(f"**失敗 {i}** - 段落 {failure['paragraph_index']}")
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.markdown("**預期（來自 LLM）：**")
-                                    st.code(failure['expected_text'][:200], language=None)
-                                with col2:
-                                    st.markdown("**實際（文件中）：**")
-                                    st.code(failure['actual_text'][:200], language=None)
-                                
-                                st.markdown("**預期修正：**")
-                                st.code(failure['corrected_text'][:200], language=None)
-                                st.caption(f"原因：{failure['edit_reason']}")
-                                
-                                # Show character-level diff between expected and actual
-                                if failure['expected_text'] != failure['actual_text']:
-                                    st.markdown("**差異（預期 vs 實際）：**")
-                                    exp_chars = set(failure['expected_text'])
-                                    act_chars = set(failure['actual_text'])
-                                    st.caption(f"Length: Expected={len(failure['expected_text'])}, Actual={len(failure['actual_text'])}")
-                                    if exp_chars != act_chars:
-                                        st.caption(f"Unique chars in expected: {exp_chars - act_chars}")
-                                        st.caption(f"Unique chars in actual: {act_chars - exp_chars}")
-                                
-                                st.markdown("---")
-                            
-                            if len(mismatch_failures) > 20:
-                                st.caption(f"顯示前 20 個，共 {len(mismatch_failures)} 個文字不符失敗")
                         
                         # Show out of range failures
                         if range_failures:
@@ -1196,7 +1234,7 @@ def main():
                             for i, failure in enumerate(exception_failures[:10], 1):
                                 st.markdown(f"**例外 {i}** - 段落 {failure['paragraph_index']}")
                                 st.code(failure['error_message'])
-                                st.caption(f"預期：{failure['expected_text'][:100]}...")
+                                st.caption(f"修正內容：{failure['corrected_text'][:100]}")
                                 st.markdown("---")
                         
                         # Export debug data

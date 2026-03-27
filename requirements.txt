@@ -5,3 +5,4 @@ lxml
 openai
 pydantic
 requests
+supabase
