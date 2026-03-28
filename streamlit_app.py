@@ -1068,10 +1068,21 @@ def main():
             st.warning("⚠️ 請在側邊欄輸入您的 OpenRouter API 金鑰")
             return
         
+        file_bytes = uploaded_file.getvalue()
+        current_doc_signature = hashlib.md5(file_bytes).hexdigest()
+
+        # Clear cached proofreading result when user uploads a different file
+        if st.session_state.get("proofread_result_doc_signature") != current_doc_signature:
+            st.session_state.pop("proofread_result_data", None)
+            st.session_state.pop("proofread_stats", None)
+            st.session_state.pop("proofread_output_data", None)
+            st.session_state.pop("proofread_output_filename", None)
+            st.session_state.pop("edit_page", None)
+
         tmp_input_path = None
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_input:
             tmp_input_path = tmp_input.name
-            tmp_input.write(uploaded_file.read())
+            tmp_input.write(file_bytes)
         
         try:
             with st.spinner("📖 讀取文件中..."):
@@ -1140,137 +1151,156 @@ def main():
                 
                 if result is None:
                     st.error("❌ 無法取得校對結果")
-                    return
-                
+                else:
+                    st.session_state["proofread_result_data"] = result.model_dump()
+                    st.session_state["proofread_result_doc_signature"] = current_doc_signature
+                    st.session_state["edit_page"] = 1
+
+                    if result.edits:
+                        with st.spinner("✏️ 套用追蹤修訂中..."):
+                            stats = apply_tracked_changes(rdoc, result.edits, author_name)
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_output:
+                            tmp_output_path = tmp_output.name
+
+                        rdoc.save(tmp_output_path)
+
+                        with open(tmp_output_path, "rb") as f:
+                            output_data = f.read()
+
+                        os.unlink(tmp_output_path)
+
+                        original_name = uploaded_file.name.rsplit(".", 1)[0]
+                        output_filename = f"{original_name}_proofread.docx"
+
+                        st.session_state["proofread_stats"] = stats
+                        st.session_state["proofread_output_data"] = output_data
+                        st.session_state["proofread_output_filename"] = output_filename
+                    else:
+                        st.session_state["proofread_stats"] = None
+                        st.session_state["proofread_output_data"] = None
+                        st.session_state["proofread_output_filename"] = None
+
+            stored_result_data = st.session_state.get("proofread_result_data")
+            if stored_result_data and st.session_state.get("proofread_result_doc_signature") == current_doc_signature:
+                result = ProofreadingResponse(**stored_result_data)
+
                 if not result.edits:
                     st.info("✨ 無需修正！您的文件看起來很棒。")
                     st.markdown(f"**AI 摘要：** {result.summary}")
-                    return
-                
-                st.success(f"✅ 找到 {len(result.edits)} 個建議修正")
-                st.markdown(f"**摘要：** {result.summary}")
-                
-                with st.expander("📝 建議修改", expanded=True):
-                    # Add pagination for edits if there are many
-                    total_edits = len(result.edits)
-                    
-                    if total_edits > DEFAULT_EDITS_PER_PAGE:
-                        edits_per_page = DEFAULT_EDITS_PER_PAGE
-                        total_edit_pages = (total_edits + edits_per_page - 1) // edits_per_page
-                        
-                        edit_page = st.number_input(
-                            f"修改頁面 (1-{total_edit_pages})",
-                            min_value=1,
-                            max_value=total_edit_pages,
-                            value=1,
-                            step=1,
-                            key="edit_page"
-                        )
-                        
-                        start_edit = (edit_page - 1) * edits_per_page
-                        end_edit = min(start_edit + edits_per_page, total_edits)
-                        edits_to_show = result.edits[start_edit:end_edit]
-                        edit_offset = start_edit
-                    else:
-                        edits_to_show = result.edits
-                        edit_offset = 0
-                    
-                    for i, edit in enumerate(edits_to_show, edit_offset + 1):
-                        st.markdown(f"**修改 {i}** (段落 {edit.paragraph_index})")
-                        
-                        # Look up original text from document
-                        if 0 <= edit.paragraph_index < len(rdoc.paragraphs):
-                            original_text = rdoc.paragraphs[edit.paragraph_index].text
+                else:
+                    st.success(f"✅ 找到 {len(result.edits)} 個建議修正")
+                    st.markdown(f"**摘要：** {result.summary}")
+
+                    with st.expander("📝 建議修改", expanded=True):
+                        total_edits = len(result.edits)
+
+                        if total_edits > DEFAULT_EDITS_PER_PAGE:
+                            edits_per_page = DEFAULT_EDITS_PER_PAGE
+                            total_edit_pages = (total_edits + edits_per_page - 1) // edits_per_page
+
+                            edit_page = st.number_input(
+                                f"修改頁面 (1-{total_edit_pages})",
+                                min_value=1,
+                                max_value=total_edit_pages,
+                                value=1,
+                                step=1,
+                                key="edit_page"
+                            )
+
+                            start_edit = (edit_page - 1) * edits_per_page
+                            end_edit = min(start_edit + edits_per_page, total_edits)
+                            edits_to_show = result.edits[start_edit:end_edit]
+                            edit_offset = start_edit
                         else:
-                            original_text = "(段落索引超出範圍)"
-                        
-                        diffs = compute_character_diffs(original_text, edit.corrected_text)
-                        
-                        st.markdown("**原文：**")
-                        st.code(original_text, language=None)
-                        st.markdown("**修正後：**")
-                        st.code(edit.corrected_text, language=None)
-                        
-                        st.markdown("**字元級別修改：**")
-                        for op, start, end, text in diffs:
-                            if op == 'delete':
-                                st.markdown(f"🔴 刪除位置 {start}-{end}：`{text}`")
-                            elif op == 'insert':
-                                st.markdown(f"🟢 插入位置 {start}：`{text}`")
-                            elif op == 'replace':
-                                st.markdown(f"🟡 替換位置 {start}-{end} 為：`{text}`")
-                        
-                        st.caption(f"💡 {edit.reason}")
-                        st.markdown("---")
-                
-                with st.spinner("✏️ 套用追蹤修訂中..."):
-                    stats = apply_tracked_changes(rdoc, result.edits, author_name)
-                
-                st.info(f"📊 已套用 {stats['deletions']} 個刪除和 {stats['insertions']} 個插入")
-                
-                if stats['errors'] > 0:
-                    st.warning(f"⚠️ {stats['errors']} 個修改無法套用")
-                    
-                    # Debug interface for failed edits
-                    with st.expander("🔍 除錯：失敗修改詳情", expanded=False):
-                        st.markdown("### 失敗修改分析")
-                        st.caption(f"總失敗數：{len(stats['failed_edits'])}")
-                        
-                        # Group by failure reason
-                        range_failures = [f for f in stats['failed_edits'] if f['reason'] == 'out_of_range']
-                        exception_failures = [f for f in stats['failed_edits'] if f['reason'] == 'exception']
-                        
-                        st.markdown(f"- **超出範圍**：{len(range_failures)}")
-                        st.markdown(f"- **例外錯誤**：{len(exception_failures)}")
-                        
-                        # Show out of range failures
-                        if range_failures:
-                            st.markdown("### 📍 超出範圍失敗")
-                            for failure in range_failures:
-                                st.markdown(f"- 段落 {failure['paragraph_index']}（文件共有 {failure['total_paragraphs']} 個段落）")
-                        
-                        # Show exception failures
-                        if exception_failures:
-                            st.markdown("### ⚠️ 例外錯誤失敗")
-                            for i, failure in enumerate(exception_failures[:10], 1):
-                                st.markdown(f"**例外 {i}** - 段落 {failure['paragraph_index']}")
-                                st.code(failure['error_message'])
-                                st.caption(f"修正內容：{failure['corrected_text'][:100]}")
-                                st.markdown("---")
-                        
-                        # Export debug data
-                        st.markdown("### 💾 匯出除錯資料")
-                        debug_json = json.dumps(stats['failed_edits'], indent=2, ensure_ascii=False)
+                            edits_to_show = result.edits
+                            edit_offset = 0
+
+                        for i, edit in enumerate(edits_to_show, edit_offset + 1):
+                            st.markdown(f"**修改 {i}** (段落 {edit.paragraph_index})")
+
+                            # Look up original text from document
+                            if 0 <= edit.paragraph_index < len(rdoc.paragraphs):
+                                original_text = rdoc.paragraphs[edit.paragraph_index].text
+                            else:
+                                original_text = "(段落索引超出範圍)"
+
+                            diffs = compute_character_diffs(original_text, edit.corrected_text)
+
+                            st.markdown("**原文：**")
+                            st.code(original_text, language=None)
+                            st.markdown("**修正後：**")
+                            st.code(edit.corrected_text, language=None)
+
+                            st.markdown("**字元級別修改：**")
+                            for op, start, end, text in diffs:
+                                if op == 'delete':
+                                    st.markdown(f"🔴 刪除位置 {start}-{end}：`{text}`")
+                                elif op == 'insert':
+                                    st.markdown(f"🟢 插入位置 {start}：`{text}`")
+                                elif op == 'replace':
+                                    st.markdown(f"🟡 替換位置 {start}-{end} 為：`{text}`")
+
+                            st.caption(f"💡 {edit.reason}")
+                            st.markdown("---")
+
+                    stats = st.session_state.get("proofread_stats")
+                    if stats:
+                        st.info(f"📊 已套用 {stats['deletions']} 個刪除和 {stats['insertions']} 個插入")
+
+                        if stats['errors'] > 0:
+                            st.warning(f"⚠️ {stats['errors']} 個修改無法套用")
+
+                            # Debug interface for failed edits
+                            with st.expander("🔍 除錯：失敗修改詳情", expanded=False):
+                                st.markdown("### 失敗修改分析")
+                                st.caption(f"總失敗數：{len(stats['failed_edits'])}")
+
+                                # Group by failure reason
+                                range_failures = [f for f in stats['failed_edits'] if f['reason'] == 'out_of_range']
+                                exception_failures = [f for f in stats['failed_edits'] if f['reason'] == 'exception']
+
+                                st.markdown(f"- **超出範圍**：{len(range_failures)}")
+                                st.markdown(f"- **例外錯誤**：{len(exception_failures)}")
+
+                                # Show out of range failures
+                                if range_failures:
+                                    st.markdown("### 📍 超出範圍失敗")
+                                    for failure in range_failures:
+                                        st.markdown(f"- 段落 {failure['paragraph_index']}（文件共有 {failure['total_paragraphs']} 個段落）")
+
+                                # Show exception failures
+                                if exception_failures:
+                                    st.markdown("### ⚠️ 例外錯誤失敗")
+                                    for i, failure in enumerate(exception_failures[:10], 1):
+                                        st.markdown(f"**例外 {i}** - 段落 {failure['paragraph_index']}")
+                                        st.code(failure['error_message'])
+                                        st.caption(f"修正內容：{failure['corrected_text'][:100]}")
+                                        st.markdown("---")
+
+                                # Export debug data
+                                st.markdown("### 💾 匯出除錯資料")
+                                debug_json = json.dumps(stats['failed_edits'], indent=2, ensure_ascii=False)
+                                st.download_button(
+                                    label="下載失敗修改 JSON",
+                                    data=debug_json,
+                                    file_name="failed_edits_debug.json",
+                                    mime="application/json"
+                                )
+
+                    output_data = st.session_state.get("proofread_output_data")
+                    output_filename = st.session_state.get("proofread_output_filename")
+                    if output_data and output_filename:
                         st.download_button(
-                            label="下載失敗修改 JSON",
-                            data=debug_json,
-                            file_name="failed_edits_debug.json",
-                            mime="application/json"
+                            label="⬇️ 下載校對後的文件",
+                            data=output_data,
+                            file_name=output_filename,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            type="primary",
+                            use_container_width=True
                         )
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_output:
-                    tmp_output_path = tmp_output.name
-                
-                rdoc.save(tmp_output_path)
-                
-                with open(tmp_output_path, "rb") as f:
-                    output_data = f.read()
-                
-                original_name = uploaded_file.name.rsplit(".", 1)[0]
-                output_filename = f"{original_name}_proofread.docx"
-                
-                st.download_button(
-                    label="⬇️ 下載校對後的文件",
-                    data=output_data,
-                    file_name=output_filename,
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    type="primary",
-                    use_container_width=True
-                )
-                
-                st.success("✅ 文件已準備好！在 Microsoft Word 中開啟以檢視追蹤修訂。")
-                
-                os.unlink(tmp_output_path)
+
+                        st.success("✅ 文件已準備好！在 Microsoft Word 中開啟以檢視追蹤修訂。")
         
         except Exception as e:
             st.error(f"❌ 處理文件時發生錯誤：{str(e)}")
