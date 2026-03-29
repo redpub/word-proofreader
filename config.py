@@ -6,9 +6,9 @@ Contains model configurations and other settings.
 # Available LLM models
 POPULAR_MODELS = [
     "x-ai/grok-4.1-fast",
+    "x-ai/grok-4.20-beta",
     "z-ai/glm-4.5",
-    "z-ai/glm-4.5-air",
-    "qwen/qwen3.5-flash-02-23"
+    "z-ai/glm-4.5-air"
 ]
 
 # Processing configuration
