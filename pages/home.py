@@ -638,7 +638,7 @@ def proofread_chunk_with_llm(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.1,
+            "temperature": 0,
             "response_format": {"type": "json_object"}
         }
         if max_completion_tokens:
@@ -774,7 +774,7 @@ def proofread_chunk_with_google_llm(
             config={
                 # "thinking_level": "medium",
                 "system_instruction": system_prompt,
-                "temperature": 0.1,
+                "temperature": 0,
                 "response_mime_type": "application/json",
             },
         )
