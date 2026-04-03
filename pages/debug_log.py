@@ -376,5 +376,3 @@ def show_run_detail(run_id: str):
 
 if __name__ == "__main__":
     main()
-else:
-    main()
