@@ -6,6 +6,7 @@ so logging never breaks the proofreading pipeline.
 """
 
 from typing import Any, Dict, List, Optional
+from db_tables import get_table_name
 
 
 def create_run(
@@ -48,7 +49,7 @@ def create_run(
             "model_info": model_info,
             "document_paragraphs": document_paragraphs,
         }
-        response = supabase.table("proofreading_runs").insert(row).execute()
+        response = supabase.table(get_table_name("proofreading_runs")).insert(row).execute()
         return response.data[0]["id"] if response.data else None
     except Exception as e:
         print(f"[debug_logging] create_run failed: {e}")
@@ -91,7 +92,7 @@ def insert_chunk(
             "duration_seconds": duration_seconds,
             "error_message": error_message,
         }
-        supabase.table("proofreading_chunks").insert(row).execute()
+        supabase.table(get_table_name("proofreading_chunks")).insert(row).execute()
     except Exception as e:
         print(f"[debug_logging] insert_chunk failed (run={run_id}, chunk={chunk_index}): {e}")
 
@@ -107,7 +108,7 @@ def update_run_completed(
 ) -> None:
     """Mark a run as completed with final stats. Fire-and-forget."""
     try:
-        supabase.table("proofreading_runs").update({
+        supabase.table(get_table_name("proofreading_runs")).update({
             "status": "completed",
             "total_edits": total_edits,
             "duration_seconds": duration_seconds,
@@ -135,6 +136,6 @@ def update_run_failed(
         }
         if warnings is not None:
             update["warnings"] = warnings
-        supabase.table("proofreading_runs").update(update).eq("id", run_id).execute()
+        supabase.table(get_table_name("proofreading_runs")).update(update).eq("id", run_id).execute()
     except Exception as e:
         print(f"[debug_logging] update_run_failed failed (run={run_id}): {e}")

@@ -3,6 +3,7 @@ import difflib
 import html as html_mod
 import json
 from datetime import datetime
+from db_tables import get_table_name
 
 
 ALLOWED_EMAIL_DOMAIN = "@red-publish.com"
@@ -34,7 +35,7 @@ def load_runs(limit: int = 50):
     """Load recent proofreading runs."""
     sb = get_supabase_client()
     response = (
-        sb.table("proofreading_runs")
+        sb.table(get_table_name("proofreading_runs"))
         .select("id, created_at, user_email, file_name, provider, model, prompt_name, "
                 "process_percentage, total_paragraphs, total_chunks, total_edits, "
                 "duration_seconds, status, chunk_size")
@@ -49,7 +50,7 @@ def load_run_detail(run_id: str):
     """Load full run record."""
     sb = get_supabase_client()
     response = (
-        sb.table("proofreading_runs")
+        sb.table(get_table_name("proofreading_runs"))
         .select("*")
         .eq("id", run_id)
         .single()
@@ -62,7 +63,7 @@ def load_chunks(run_id: str):
     """Load all chunks for a run, ordered by chunk_index."""
     sb = get_supabase_client()
     response = (
-        sb.table("proofreading_chunks")
+        sb.table(get_table_name("proofreading_chunks"))
         .select("*")
         .eq("run_id", run_id)
         .order("chunk_index")
@@ -133,6 +134,26 @@ def render_tracked_changes_html(original: str, corrected: str) -> str:
                 f'{html_mod.escape(corrected[j1:j2])}</span>'
             )
     return ''.join(parts)
+
+
+ZERO_WIDTH_BOUNDARY_CHARS = {"\u200B", "\u200C", "\u200D", "\uFEFF", "\u2060"}
+
+
+def strip_boundary_whitespace_for_preview(text: str) -> str:
+    """Strip leading/trailing whitespace (including zero-width marks) for preview only."""
+    if not text:
+        return text
+
+    start = 0
+    end = len(text)
+
+    while start < end and (text[start].isspace() or text[start] in ZERO_WIDTH_BOUNDARY_CHARS):
+        start += 1
+
+    while end > start and (text[end - 1].isspace() or text[end - 1] in ZERO_WIDTH_BOUNDARY_CHARS):
+        end -= 1
+
+    return text[start:end]
 
 
 def main():
@@ -348,6 +369,11 @@ def show_run_detail(run_id: str):
                 if not edits:
                     st.info("此區塊無修改")
                 else:
+                    ignore_boundary_ws = st.checkbox(
+                        "忽略段落前後的空白",
+                        value=True,
+                        key=f"ignore_boundary_whitespace_debug_{cidx}",
+                    )
                     st.caption(f"共 {len(edits)} 項修改")
                     for edit_i, edit in enumerate(edits):
                         pidx = edit.get("paragraph_index")
@@ -357,7 +383,13 @@ def show_run_detail(run_id: str):
 
                         st.markdown(f"**段落 {pidx}**")
                         if original:
-                            tracked_html = render_tracked_changes_html(original, corrected)
+                            preview_original = original
+                            preview_corrected = corrected
+                            if ignore_boundary_ws:
+                                preview_original = strip_boundary_whitespace_for_preview(preview_original)
+                                preview_corrected = strip_boundary_whitespace_for_preview(preview_corrected)
+
+                            tracked_html = render_tracked_changes_html(preview_original, preview_corrected)
                             st.markdown(
                                 f'<div style="padding:0.75em 1em;border:1px solid #ddd;'
                                 f'border-radius:6px;line-height:1.8;font-size:1rem;'

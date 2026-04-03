@@ -15,6 +15,7 @@ from openai import OpenAI
 from docx_revisions import RevisionDocument, RevisionParagraph
 from pydantic import BaseModel
 from supabase import create_client, Client
+from db_tables import get_table_name
 from config import (
     LLM_PROVIDERS,
     OPENROUTER_MODELS,
@@ -66,7 +67,7 @@ def load_prompts() -> Dict[str, Dict[str, Any]]:
     """
     try:
         supabase = get_supabase_client()
-        response = supabase.table("prompts").select("name, content, is_protected").order("created_at").execute()
+        response = supabase.table(get_table_name("prompts")).select("name, content, is_protected").order("created_at").execute()
         
         prompts = OrderedDict()
         default_name = "預設"
@@ -125,7 +126,7 @@ def add_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -> T
     
     try:
         supabase = get_supabase_client()
-        supabase.table("prompts").insert({
+        supabase.table(get_table_name("prompts")).insert({
             "name": name,
             "content": content,
             "is_protected": False,
@@ -150,7 +151,7 @@ def update_prompt(prompts: Dict[str, Dict[str, Any]], name: str, content: str) -
     
     try:
         supabase = get_supabase_client()
-        supabase.table("prompts").update({
+        supabase.table(get_table_name("prompts")).update({
             "content": content,
         }).eq("name", name).execute()
         return True, f"已更新提示 '{name}'"
@@ -170,7 +171,7 @@ def delete_prompt(prompts: Dict[str, Dict[str, Any]], name: str) -> Tuple[bool, 
     
     try:
         supabase = get_supabase_client()
-        supabase.table("prompts").delete().eq("name", name).execute()
+        supabase.table(get_table_name("prompts")).delete().eq("name", name).execute()
         return True, f"已刪除提示 '{name}'"
     except Exception as e:
         return False, f"刪除失敗：{str(e)}"
@@ -996,6 +997,29 @@ def render_tracked_changes_html(original: str, corrected: str) -> str:
             )
     return ''.join(parts)
 
+
+ZERO_WIDTH_BOUNDARY_CHARS = {"\u200B", "\u200C", "\u200D", "\uFEFF", "\u2060"}
+
+
+def strip_boundary_whitespace_for_preview(text: str) -> str:
+    """
+    Strip boundary whitespace for UI preview only.
+    Includes all Python-recognized whitespace plus common zero-width marks.
+    """
+    if not text:
+        return text
+
+    start = 0
+    end = len(text)
+
+    while start < end and (text[start].isspace() or text[start] in ZERO_WIDTH_BOUNDARY_CHARS):
+        start += 1
+
+    while end > start and (text[end - 1].isspace() or text[end - 1] in ZERO_WIDTH_BOUNDARY_CHARS):
+        end -= 1
+
+    return text[start:end]
+
 def compute_character_diffs(original: str, corrected: str) -> List[Tuple[str, int, int, str]]:
     """
     Compute character-level differences between original and corrected text.
@@ -1770,6 +1794,12 @@ def main():
                             edits_to_show = result.edits
                             edit_offset = 0
 
+                        ignore_boundary_ws = st.checkbox(
+                            "忽略段落前後的空白",
+                            value=True,
+                            key="ignore_boundary_whitespace_main",
+                        )
+
                         for i, edit in enumerate(edits_to_show, edit_offset + 1):
                             st.markdown(f"**修改 {i}** (段落 {edit.paragraph_index})")
 
@@ -1782,7 +1812,13 @@ def main():
                             else:
                                 original_text = "(段落索引超出範圍)"
 
-                            tracked_html = render_tracked_changes_html(original_text, edit.corrected_text)
+                            preview_original = original_text
+                            preview_corrected = edit.corrected_text
+                            if ignore_boundary_ws:
+                                preview_original = strip_boundary_whitespace_for_preview(preview_original)
+                                preview_corrected = strip_boundary_whitespace_for_preview(preview_corrected)
+
+                            tracked_html = render_tracked_changes_html(preview_original, preview_corrected)
                             st.markdown(
                                 f'<div style="padding:0.75em 1em;border:1px solid #ddd;border-radius:6px;'
                                 f'line-height:1.8;font-size:1rem;white-space:pre-wrap;">'
