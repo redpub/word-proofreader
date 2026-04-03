@@ -16,25 +16,24 @@ from docx_revisions import RevisionDocument, RevisionParagraph
 from pydantic import BaseModel
 from supabase import create_client, Client
 from config import (
-    POPULAR_MODELS,
+    LLM_PROVIDERS,
+    OPENROUTER_MODELS,
+    GOOGLE_VERTEX_MODELS,
+    GOOGLE_VERTEX_MODEL_LIMITS,
     DEFAULT_CHUNK_SIZE,
     MAX_CHUNK_SIZE,
     DEFAULT_MAX_WORKERS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_DELAY,
     TOKEN_CUSHION_FACTOR,
-    TOKENS_PER_CHAR_ESTIMATE,
     PROMPT_TEMPLATE_OVERHEAD,
     MIN_COMPLETION_RESERVE,
     DEFAULT_PARAGRAPHS_PER_PAGE,
     DEFAULT_EDITS_PER_PAGE
 )
 
-st.set_page_config(
-    page_title="AI Word Proofreader",
-    page_icon="📝",
-    layout="wide"
-)
+
+ALLOWED_EMAIL_DOMAIN = "@red-publish.com"
 
 class Edit(BaseModel):
     paragraph_index: int
@@ -182,6 +181,89 @@ def get_openrouter_client(api_key: str) -> OpenAI:
         api_key=api_key,
     )
 
+def parse_google_service_account_info(raw_service_account: Any) -> Dict[str, Any]:
+    """Parse and validate Google service account JSON from secrets."""
+    if isinstance(raw_service_account, str):
+        try:
+            service_account_info = json.loads(raw_service_account)
+        except json.JSONDecodeError as decode_error:
+            raise ValueError("google_vertex.service_account_json 不是有效的 JSON") from decode_error
+    elif isinstance(raw_service_account, dict):
+        service_account_info = raw_service_account
+    elif hasattr(raw_service_account, "items"):
+        service_account_info = dict(raw_service_account.items())
+    else:
+        raise ValueError("google_vertex.service_account_json 格式錯誤，需為 JSON 字串或物件")
+
+    required_fields = ["client_email", "token_uri", "private_key"]
+    missing_fields = [field for field in required_fields if not service_account_info.get(field)]
+    if missing_fields:
+        raise ValueError(
+            "google_vertex.service_account_json 缺少必要欄位："
+            + ", ".join(missing_fields)
+            + "。請使用 GCP 服務帳戶金鑰 JSON（不要使用 OAuth Client ID 設定）。"
+        )
+
+    return service_account_info
+
+def get_google_vertex_client() -> Any:
+    """Initialize Google Vertex AI client from secrets.toml [google_vertex]."""
+    try:
+        from google import genai
+        from google.oauth2 import service_account
+    except ImportError as import_error:
+        raise ValueError(
+            "缺少 Google Vertex 相依套件：請安裝 google-genai 與 google-auth，"
+            "例如執行 `pip install google-genai google-auth`"
+        ) from import_error
+
+    settings = st.secrets.get("google_vertex", {})
+    project_id = settings.get("project_id")
+    location = settings.get("location")
+    raw_service_account = settings.get("service_account_json")
+
+    if not project_id:
+        raise ValueError("缺少 Google Vertex 設定：請在 secrets.toml 的 [google_vertex] 提供 project_id")
+    if not location:
+        raise ValueError("缺少 Google Vertex 設定：請在 secrets.toml 的 [google_vertex] 提供 location")
+
+    if not raw_service_account:
+        raise ValueError("缺少 Google Vertex 設定：請在 secrets.toml 的 [google_vertex] 提供 service_account_json")
+
+    service_account_info = parse_google_service_account_info(raw_service_account)
+
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+
+    return genai.Client(
+        vertexai=True,
+        project=project_id,
+        location=location,
+        credentials=credentials,
+    )
+
+def fetch_google_vertex_models(client: Any) -> List[str]:
+    """Fetch available Gemini models from Vertex AI for the current project/location."""
+    try:
+        model_names: List[str] = []
+        for model in client.models.list():
+            full_name = getattr(model, "name", "") or ""
+            short_name = full_name.split("/")[-1] if full_name else ""
+            if not short_name.startswith("gemini"):
+                continue
+
+            supported_actions = getattr(model, "supported_actions", None) or []
+            if supported_actions and not any("generate" in str(action).lower() for action in supported_actions):
+                continue
+
+            model_names.append(short_name)
+
+        return sorted(set(model_names))
+    except Exception as e:
+        raise ValueError(f"無法從 Google Vertex 取得模型清單：{str(e)}") from e
+
 def check_api_credits(api_key: str) -> Optional[Dict]:
     """
     Check OpenRouter API key credits.
@@ -198,6 +280,42 @@ def check_api_credits(api_key: str) -> Optional[Dict]:
         return None
     except Exception:
         return None
+
+def fetch_google_model_info(client: Any, model_id: str) -> Tuple[Optional[Dict], str]:
+    """
+    Fetch model metadata for Google Vertex models.
+    Primary: lookup from GOOGLE_VERTEX_MODEL_LIMITS (hardcoded, instant).
+    Fallback: query Vertex API for unknown models.
+    """
+    # Primary: hardcoded lookup (API metadata often returns None for token limits)
+    if model_id in GOOGLE_VERTEX_MODEL_LIMITS:
+        input_limit, output_limit = GOOGLE_VERTEX_MODEL_LIMITS[model_id]
+        return {
+            "id": model_id,
+            "name": model_id,
+            "context_length": input_limit,
+            "max_completion_tokens": output_limit,
+        }, f"來源=hardcoded, input_token_limit={input_limit:,}, output_token_limit={output_limit:,}"
+
+    # Fallback: try Vertex API for models not in the lookup table
+    diagnostics: List[str] = []
+    for candidate in [model_id, f"publishers/google/models/{model_id}"]:
+        try:
+            model_obj = client.models.get(model=candidate)
+            input_limit = getattr(model_obj, "input_token_limit", 0) or 0
+            output_limit = getattr(model_obj, "output_token_limit", 0) or 0
+            if input_limit > 0:
+                return {
+                    "id": model_id,
+                    "name": getattr(model_obj, "display_name", model_id),
+                    "context_length": int(input_limit),
+                    "max_completion_tokens": int(output_limit),
+                }, f"來源=API/{candidate}, input_token_limit={int(input_limit):,}, output_token_limit={int(output_limit):,}"
+            diagnostics.append(f"{candidate}: input_token_limit=0")
+        except Exception as e:
+            diagnostics.append(f"{candidate}: {str(e)}")
+
+    return None, " | ".join(diagnostics) if diagnostics else "未取得任何模型限制資訊"
 
 def fetch_model_info(api_key: str, model_id: str) -> Optional[Dict]:
     """
@@ -227,13 +345,53 @@ def fetch_model_info(api_key: str, model_id: str) -> Optional[Dict]:
     except Exception:
         return None
 
+_tiktoken_encoder = None
+_tiktoken_load_attempted = False
+
+def _get_tiktoken_encoder():
+    """Lazy-load tiktoken cl100k_base encoder (used by GPT-4 family). Cached after first call."""
+    global _tiktoken_encoder, _tiktoken_load_attempted
+    if _tiktoken_load_attempted:
+        return _tiktoken_encoder
+    _tiktoken_load_attempted = True
+    try:
+        import tiktoken
+        _tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        _tiktoken_encoder = None
+    return _tiktoken_encoder
+
+def _estimate_tokens_cjk_heuristic(text: str) -> int:
+    """
+    CJK-aware heuristic fallback for token estimation.
+    CJK characters ~1.5 tokens each; ASCII ~0.25 tokens per char (1 token per 4 chars).
+    """
+    cjk_count = 0
+    ascii_count = 0
+    for ch in text:
+        cp = ord(ch)
+        if (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or
+                0x2E80 <= cp <= 0x2EFF or 0x3000 <= cp <= 0x303F or
+                0xFF00 <= cp <= 0xFFEF or 0xF900 <= cp <= 0xFAFF or
+                0x20000 <= cp <= 0x2A6DF):
+            cjk_count += 1
+        else:
+            ascii_count += 1
+    return int(cjk_count * 1.5 + ascii_count * 0.25) or 1
+
 def estimate_tokens(text: str) -> int:
     """
-    Estimate token count for a string using a conservative CJK-aware heuristic.
-    CJK characters typically map to 1-2 tokens; ASCII words ~1 token per 4 chars.
-    We use a single conservative multiplier for safety.
+    Estimate token count using tiktoken (cl100k_base) with CJK heuristic fallback.
+    tiktoken gives accurate counts for most LLM tokenizers.
+    Falls back to a CJK-aware character heuristic if tiktoken is unavailable.
     """
-    return int(len(text) * TOKENS_PER_CHAR_ESTIMATE)
+    encoder = _get_tiktoken_encoder()
+    if encoder is not None:
+        try:
+            return len(encoder.encode(text))
+        except Exception:
+            pass
+    return _estimate_tokens_cjk_heuristic(text)
 
 def compute_dynamic_chunk_size(
     rdoc: RevisionDocument,
@@ -266,22 +424,23 @@ def compute_dynamic_chunk_size(
     total_paragraphs = len(rdoc.paragraphs)
     paragraphs_to_process = max(1, int(total_paragraphs * process_percentage / 100))
     
-    # Sample up to 200 paragraphs to get average size (avoid scanning huge documents fully)
+    # Sample up to 200 paragraphs to get average token count per paragraph
     sample_size = min(paragraphs_to_process, 200)
-    total_chars = 0
+    total_tokens = 0
     for i in range(sample_size):
         text = rdoc.paragraphs[i].text.strip()
         if text:
-            # Account for the "[index|hash] " prefix (~15 chars overhead per line)
-            total_chars += len(text) + 15
+            # Estimate tokens for the full line as it appears in the prompt: "[i|hash] text"
+            line = f"[{i}|abcd1234] {text}"
+            total_tokens += estimate_tokens(line)
         else:
-            # Empty paragraph marker
-            total_chars += 25
+            # Empty paragraph marker "[i] (empty paragraph)"
+            total_tokens += estimate_tokens(f"[{i}] (empty paragraph)")
     
-    if total_chars == 0:
+    if total_tokens == 0:
         return DEFAULT_CHUNK_SIZE
     
-    avg_tokens_per_para = int((total_chars / sample_size) * TOKENS_PER_CHAR_ESTIMATE)
+    avg_tokens_per_para = max(1, total_tokens // sample_size)
     
     if avg_tokens_per_para <= 0:
         return DEFAULT_CHUNK_SIZE
@@ -352,28 +511,39 @@ def read_document_paragraphs(rdoc: RevisionDocument) -> str:
     return "\n".join(lines)
 
 def proofread_chunk_with_retry(
-    client: OpenAI,
+    client: Any,
+    provider: str,
     model: str,
     chunk_text: str,
     system_prompt: str,
     chunk_info: str = "",
     max_retries: int = 3,
     initial_delay: float = 1.0,
-    max_completion_tokens: Optional[int] = None
-) -> Tuple[Optional[ProofreadingResponse], List[str]]:
+    max_completion_tokens: Optional[int] = None,
+    input_token_limit: int = 0
+) -> Tuple[Optional[ProofreadingResponse], List[str], Dict[str, Any]]:
     """
     Wrapper function that retries chunk processing with exponential backoff.
-    Returns (result, warnings) tuple. Warnings are collected instead of calling
+    Returns (result, warnings, debug_info) tuple. Warnings are collected instead of calling
     st.warning() directly, since this function may run in worker threads where
     Streamlit calls are not thread-safe.
     """
     warnings = []
+    debug_info: Dict[str, Any] = {"user_prompt": "", "raw_response": None, "retries": 0}
+    chunk_start = time.time()
     for attempt in range(max_retries):
         try:
-            result, chunk_warnings = proofread_chunk_with_llm(client, model, chunk_text, system_prompt, chunk_info, max_completion_tokens=max_completion_tokens)
+            if provider == "google":
+                result, chunk_warnings, chunk_debug = proofread_chunk_with_google_llm(client, model, chunk_text, system_prompt, chunk_info, input_token_limit=input_token_limit)
+            else:
+                result, chunk_warnings, chunk_debug = proofread_chunk_with_llm(client, model, chunk_text, system_prompt, chunk_info, max_completion_tokens=max_completion_tokens)
             warnings.extend(chunk_warnings)
+            debug_info.update(chunk_debug)
+            debug_info["retries"] = attempt
             if result is not None:
-                return result, warnings
+                debug_info["duration_seconds"] = time.time() - chunk_start
+                debug_info["status"] = "success"
+                return result, warnings, debug_info
             
             # If result is None but no exception, still retry
             if attempt < max_retries - 1:
@@ -388,9 +558,16 @@ def proofread_chunk_with_retry(
                 time.sleep(delay)
             else:
                 warnings.append(f"失敗{chunk_info}，已重試 {max_retries} 次：{str(e)}")
-                return None, warnings
+                debug_info["retries"] = attempt
+                debug_info["duration_seconds"] = time.time() - chunk_start
+                debug_info["status"] = "failed"
+                debug_info["error_message"] = str(e)
+                return None, warnings, debug_info
     
-    return None, warnings
+    debug_info["retries"] = max_retries - 1
+    debug_info["duration_seconds"] = time.time() - chunk_start
+    debug_info["status"] = "failed"
+    return None, warnings, debug_info
 
 def chunk_paragraphs(rdoc: RevisionDocument, chunk_size: int = 100, process_percentage: int = 100) -> List[Tuple[int, int, str]]:
     """
@@ -436,53 +613,23 @@ def proofread_chunk_with_llm(
     system_prompt: str,
     chunk_info: str = "",
     max_completion_tokens: Optional[int] = None
-) -> Tuple[Optional[ProofreadingResponse], List[str]]:
+) -> Tuple[Optional[ProofreadingResponse], List[str], Dict[str, Any]]:
     """
     Process a single chunk with the LLM.
-    Returns (result, warnings) tuple. Warnings are collected instead of calling
+    Returns (result, warnings, debug_info) tuple. Warnings are collected instead of calling
     st.*() directly, since this function may run in worker threads where
     Streamlit calls are not thread-safe.
     """
     warnings = []
+    debug_info: Dict[str, Any] = {"user_prompt": "", "raw_response": None}
     try:
-        user_prompt = f"""Here is the document chunk to proofread{chunk_info}:
+        user_prompt = f"""以下是需要校對的段落{chunk_info}:
 
 {chunk_text}
 
-Please analyze this document and provide corrections in the following JSON format.
-IMPORTANT: Your response must be VALID JSON only, with no additional text before or after.
+"""
 
-{{
-    "edits": [
-        {{
-            "paragraph_index": 0,
-            "corrected_text": "the complete corrected paragraph text",
-            "reason": "why this change improves the text"
-        }}
-    ],
-    "summary": "所有修改的簡短摘要（繁體中文）"
-}}
-
-RULES:
-1. Each paragraph is shown as [index|hash] text. Return the paragraph_index (the number before the |) for each edit.
-2. Provide the COMPLETE corrected paragraph text in corrected_text (the full paragraph with your corrections applied).
-3. Only include paragraphs that need corrections.
-4. SKIP paragraphs marked as "(empty paragraph)" - do not suggest edits for them.
-5. The corrected_text should contain ONLY the corrected text, NOT the [index|hash] prefix.
-6. Ensure all strings are properly escaped for JSON (escape quotes, newlines, etc.)
-7. If no corrections are needed, return: {{"edits": [], "summary": "無需修正"}}
-8. The "summary" and "reason" fields MUST be written in Traditional Chinese (繁體中文).
-
-EXAMPLE:
-Input: "[102|a3f9b2c1] 對於我來説，語文很難。"
-Correct JSON:
-{{
-    "paragraph_index": 102,
-    "corrected_text": "對於我來說，語文很難。",
-    "reason": "將「説」修正為「說」"
-}}
-
-Respond with valid JSON only."""
+        debug_info["user_prompt"] = user_prompt
 
         create_kwargs = {
             "model": model,
@@ -490,7 +637,7 @@ Respond with valid JSON only."""
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.3,
+            "temperature": 0.1,
             "response_format": {"type": "json_object"}
         }
         if max_completion_tokens:
@@ -499,6 +646,7 @@ Respond with valid JSON only."""
         response = client.chat.completions.create(**create_kwargs)
         
         content = response.choices[0].message.content
+        debug_info["raw_response"] = content
         
         if not content:
             # Gather diagnostic info from the response
@@ -510,52 +658,183 @@ Respond with valid JSON only."""
                 "usage": getattr(response, "usage", None),
             }
             warnings.append(f"LLM 回傳空白回應{chunk_info}。診斷資訊：{diag}")
-            return None, warnings
+            return None, warnings, debug_info
         
         # Check for truncation before parsing
         finish_reason = response.choices[0].finish_reason
         if finish_reason == "length":
             warnings.append(f"LLM 回應被截斷（finish_reason=length）{chunk_info}。"
                             f"區塊可能超出模型的輸出上限。")
-            return None, warnings
+            return None, warnings, debug_info
         
         try:
             data = json.loads(content)
         except json.JSONDecodeError as je:
             warnings.append(f"無法解析 LLM 回應的 JSON{chunk_info}：{str(je)}")
-            return None, warnings
+            return None, warnings, debug_info
         
         if "edits" not in data:
             warnings.append(f"LLM 回應缺少 'edits' 欄位{chunk_info}")
-            return ProofreadingResponse(edits=[], summary=data.get("summary", "未提供修改")), warnings
+            return ProofreadingResponse(edits=[], summary=data.get("summary", "未提供修改")), warnings, debug_info
         
         try:
             edits = [Edit(**edit) for edit in data.get("edits", [])]
         except Exception as validation_error:
             warnings.append(f"驗證修改資料失敗{chunk_info}：{str(validation_error)}")
-            return None, warnings
+            return None, warnings, debug_info
         
         return ProofreadingResponse(
             edits=edits,
             summary=data.get("summary", "無需修正。")
-        ), warnings
+        ), warnings, debug_info
     except Exception as e:
         warnings.append(f"呼叫 LLM 時發生錯誤{chunk_info}：{str(e)}")
-        return None, warnings
+        return None, warnings, debug_info
+
+def count_tokens_google(client: Any, model: str, text: str) -> Optional[int]:
+    """
+    Count exact tokens using Google Vertex AI count_tokens API.
+    Returns token count or None if the call fails.
+    """
+    try:
+        response = client.models.count_tokens(model=model, contents=text)
+        return response.total_tokens
+    except Exception:
+        return None
+
+def _build_google_user_prompt(chunk_text: str, chunk_info: str) -> str:
+    """Build the user prompt for Google Vertex proofreading (shared by main and split paths)."""
+    return f"""以下是需要校對的段落{chunk_info}:
+
+{chunk_text}
+"""
+
+def proofread_chunk_with_google_llm(
+    client: Any,
+    model: str,
+    chunk_text: str,
+    system_prompt: str,
+    chunk_info: str = "",
+    input_token_limit: int = 0
+) -> Tuple[Optional[ProofreadingResponse], List[str], Dict[str, Any]]:
+    """Process a single chunk with Google Vertex AI Gemini model."""
+    warnings = []
+    debug_info: Dict[str, Any] = {"user_prompt": "", "raw_response": None}
+    try:
+        user_prompt = _build_google_user_prompt(chunk_text, chunk_info)
+        debug_info["user_prompt"] = user_prompt
+
+        # Verify token count before sending (safety net)
+        if input_token_limit > 0:
+            prompt_tokens = count_tokens_google(client, model, system_prompt + "\n" + user_prompt)
+            if prompt_tokens is not None and prompt_tokens > int(input_token_limit * TOKEN_CUSHION_FACTOR):
+                # Chunk too large — split in half and process each part
+                lines = chunk_text.split("\n")
+                mid = len(lines) // 2
+                if mid > 0:
+                    warnings.append(
+                        f"區塊 token 數 ({prompt_tokens:,}) 超過安全上限 "
+                        f"({int(input_token_limit * TOKEN_CUSHION_FACTOR):,}){chunk_info}，"
+                        f"自動拆分為兩半重新處理。"
+                    )
+                    first_half = "\n".join(lines[:mid])
+                    second_half = "\n".join(lines[mid:])
+                    r1, w1, d1 = proofread_chunk_with_google_llm(
+                        client, model, first_half, system_prompt,
+                        f"{chunk_info}[上半]", input_token_limit
+                    )
+                    r2, w2, d2 = proofread_chunk_with_google_llm(
+                        client, model, second_half, system_prompt,
+                        f"{chunk_info}[下半]", input_token_limit
+                    )
+                    warnings.extend(w1)
+                    warnings.extend(w2)
+                    # Combine raw responses from sub-calls
+                    sub_responses = [d1.get("raw_response"), d2.get("raw_response")]
+                    debug_info["raw_response"] = "\n---SPLIT---\n".join(r for r in sub_responses if r)
+                    combined_edits = []
+                    combined_summary_parts = []
+                    if r1:
+                        combined_edits.extend(r1.edits)
+                        combined_summary_parts.append(r1.summary)
+                    if r2:
+                        combined_edits.extend(r2.edits)
+                        combined_summary_parts.append(r2.summary)
+                    if combined_edits or combined_summary_parts:
+                        return ProofreadingResponse(
+                            edits=combined_edits,
+                            summary="；".join(combined_summary_parts) if combined_summary_parts else "無需修正"
+                        ), warnings, debug_info
+                    return None, warnings, debug_info
+
+        response = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config={
+                # "thinking_level": "medium",
+                "system_instruction": system_prompt,
+                "temperature": 0.1,
+                "response_mime_type": "application/json",
+            },
+        )
+
+        content = response.text
+        debug_info["raw_response"] = content
+        if not content:
+            warnings.append(f"Google Vertex 回傳空白回應{chunk_info}")
+            return None, warnings, debug_info
+
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as je:
+            warnings.append(f"無法解析 Google Vertex 回應的 JSON{chunk_info}：{str(je)}")
+            return None, warnings, debug_info
+
+        if "edits" not in data:
+            warnings.append(f"Google Vertex 回應缺少 'edits' 欄位{chunk_info}")
+            return ProofreadingResponse(edits=[], summary=data.get("summary", "未提供修改")), warnings, debug_info
+
+        try:
+            edits = [Edit(**edit) for edit in data.get("edits", [])]
+        except Exception as validation_error:
+            warnings.append(f"驗證 Google Vertex 修改資料失敗{chunk_info}：{str(validation_error)}")
+            return None, warnings, debug_info
+
+        return ProofreadingResponse(
+            edits=edits,
+            summary=data.get("summary", "無需修正。")
+        ), warnings, debug_info
+    except Exception as e:
+        error_text = str(e)
+        if "NOT_FOUND" in error_text and "Publisher Model" in error_text:
+            supported_models = ", ".join(GOOGLE_VERTEX_MODELS)
+            warnings.append(
+                f"呼叫 Google Vertex 時發生錯誤{chunk_info}：模型 `{model}` 在目前專案/區域不可用。"
+                f"請改用可用模型（{supported_models}）或確認 Vertex AI 區域與模型存取權限。"
+            )
+        else:
+            warnings.append(f"呼叫 Google Vertex 時發生錯誤{chunk_info}：{error_text}")
+        return None, warnings, debug_info
 
 def proofread_with_llm(
-    client: OpenAI,
+    client: Any,
+    provider: str,
     model: str,
     rdoc: RevisionDocument,
     system_prompt: str,
     max_workers: int = 5,
     process_percentage: int = 100,
-    model_info: Optional[Dict] = None
+    model_info: Optional[Dict] = None,
+    run_id: Optional[str] = None,
+    supabase_client: Any = None
 ) -> Optional[ProofreadingResponse]:
     """
     Proofread document in chunks using parallel processing.
     Chunk size is computed dynamically from model token limits when model_info is available.
+    If run_id and supabase_client are provided, logs per-chunk debug data.
     """
+    from debug_logging import insert_chunk as log_insert_chunk
+
     total_paragraphs = len(rdoc.paragraphs)
     paragraphs_to_process = max(1, int(total_paragraphs * process_percentage / 100))
     
@@ -572,6 +851,11 @@ def proofread_with_llm(
     else:
         chunk_size = DEFAULT_CHUNK_SIZE
         st.info(f"📐 使用預設區塊大小：{chunk_size} 個段落（無法取得模型資訊）")
+        if provider == "google":
+            debug_key = f"model_info_debug_{provider}_{model}"
+            debug_message = st.session_state.get(debug_key, "")
+            if debug_message:
+                st.caption(f"Google 模型資訊除錯：{debug_message}")
     
     chunks = chunk_paragraphs(rdoc, chunk_size, process_percentage)
     total_chunks = len(chunks)
@@ -598,34 +882,59 @@ def proofread_with_llm(
         # Submit all tasks
         future_to_chunk = {}
         for chunk_idx, (start_idx, end_idx, chunk_text) in enumerate(chunks):
-            chunk_info = f" (chunk {chunk_idx + 1}/{total_chunks}, paragraphs {start_idx}-{end_idx})"
+            chunk_info = f" (區塊 {chunk_idx + 1}/{total_chunks}, 段落範圍 {start_idx}-{end_idx})"
             future = executor.submit(
                 proofread_chunk_with_retry,
                 client,
+                provider,
                 model,
                 chunk_text,
                 system_prompt,
                 chunk_info,
                 max_retries=DEFAULT_MAX_RETRIES,
                 initial_delay=DEFAULT_RETRY_DELAY,
-                max_completion_tokens=model_info.get("max_completion_tokens") if model_info else None
+                max_completion_tokens=model_info.get("max_completion_tokens") if model_info else None,
+                input_token_limit=model_info.get("context_length", 0) if model_info else 0
             )
-            future_to_chunk[future] = (chunk_idx, start_idx, end_idx)
+            future_to_chunk[future] = (chunk_idx, start_idx, end_idx, chunk_text)
         
         # Collect results as they complete
         chunk_results = {}
         all_warnings = []
         for future in as_completed(future_to_chunk):
-            chunk_idx, start_idx, end_idx = future_to_chunk[future]
+            chunk_idx, start_idx, end_idx, chunk_text = future_to_chunk[future]
             completed_chunks += 1
             
             status_text.text(f"已完成 {completed_chunks}/{total_chunks} 個區塊（最新：段落 {start_idx}-{end_idx}）...")
             
             try:
-                result, warnings = future.result()
+                result, warnings, debug_info = future.result()
                 all_warnings.extend(warnings)
                 if result:
                     chunk_results[chunk_idx] = result
+
+                # Log chunk to Supabase (fire-and-forget)
+                if run_id and supabase_client:
+                    try:
+                        log_insert_chunk(
+                            supabase_client,
+                            run_id=run_id,
+                            chunk_index=chunk_idx,
+                            start_paragraph=start_idx,
+                            end_paragraph=end_idx,
+                            chunk_text=chunk_text,
+                            user_prompt=debug_info.get("user_prompt", ""),
+                            system_prompt=system_prompt,
+                            raw_response=debug_info.get("raw_response"),
+                            parsed_result=result.model_dump() if result else None,
+                            warnings=warnings,
+                            retries=debug_info.get("retries", 0),
+                            status=debug_info.get("status", "unknown"),
+                            duration_seconds=debug_info.get("duration_seconds", 0.0),
+                            error_message=debug_info.get("error_message"),
+                        )
+                    except Exception:
+                        pass  # Never let logging break proofreading
             except Exception as e:
                 all_warnings.append(f"處理區塊 {chunk_idx + 1} 時發生錯誤：{str(e)}")
             
@@ -654,6 +963,38 @@ def proofread_with_llm(
         edits=all_edits,
         summary=combined_summary
     )
+
+def render_tracked_changes_html(original: str, corrected: str) -> str:
+    """
+    Render inline tracked-changes HTML like Word's track changes view.
+    Deletions shown as red strikethrough, insertions as green underline.
+    """
+    import html as html_mod
+    matcher = difflib.SequenceMatcher(None, original, corrected)
+    parts = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            parts.append(html_mod.escape(original[i1:i2]))
+        elif tag == 'delete':
+            parts.append(
+                f'<span style="color:#c0392b;text-decoration:line-through;background:#fde8e8;">'
+                f'{html_mod.escape(original[i1:i2])}</span>'
+            )
+        elif tag == 'insert':
+            parts.append(
+                f'<span style="color:#27ae60;text-decoration:underline;background:#e8fde8;">'
+                f'{html_mod.escape(corrected[j1:j2])}</span>'
+            )
+        elif tag == 'replace':
+            parts.append(
+                f'<span style="color:#c0392b;text-decoration:line-through;background:#fde8e8;">'
+                f'{html_mod.escape(original[i1:i2])}</span>'
+            )
+            parts.append(
+                f'<span style="color:#27ae60;text-decoration:underline;background:#e8fde8;">'
+                f'{html_mod.escape(corrected[j1:j2])}</span>'
+            )
+    return ''.join(parts)
 
 def compute_character_diffs(original: str, corrected: str) -> List[Tuple[str, int, int, str]]:
     """
@@ -771,9 +1112,28 @@ def apply_tracked_changes(
     
     return stats
 
+def enforce_workspace_auth() -> None:
+    """Require Streamlit native login and restrict access to the allowed workspace domain."""
+    user_email = (getattr(st.user, "email", "") or "").strip().lower()
+    if not user_email:
+        st.login()
+        st.stop()
+
+    if not user_email.endswith(ALLOWED_EMAIL_DOMAIN):
+        st.error("❌ 未授權：僅允許 @red-publish.com 帳號存取此應用程式。")
+        st.caption(f"目前登入帳號：{user_email or '未知'}")
+        if st.button("登出", key="unauthorized_logout", type="primary"):
+            st.logout()
+        st.stop()
+
 def main():
+    enforce_workspace_auth()
+
     st.title("📝 紅出版 Word AI校對工具")
     st.markdown("上傳 Word 文件，讓 AI 進行校對並以追蹤修訂模式標記修改")
+    
+    # UI lock flag — disables all interactive elements while proofreading is running
+    is_proofreading = st.session_state.get("is_proofreading", False)
     
     # Load prompts
     if 'prompts' not in st.session_state:
@@ -784,63 +1144,93 @@ def main():
     
     with st.sidebar:
         st.header("⚙️ 設定")
-        
-        api_key = st.text_input(
-            "OpenRouter API 金鑰",
-            type="password",
-            help="從 https://openrouter.ai/keys 取得您的 API 金鑰"
-        )
-        
-        # Show API credits if key is entered
-        if api_key:
-            # Only re-check credits when API key changes or on first load
-            need_check = False
-            if 'cached_api_key' not in st.session_state or st.session_state.cached_api_key != api_key:
-                need_check = True
-            
-            if need_check:
-                with st.spinner("檢查 API 額度..."):
-                    credits_info = check_api_credits(api_key)
-                st.session_state.cached_api_key = api_key
-                st.session_state.cached_credits_info = credits_info
-            else:
-                credits_info = st.session_state.get('cached_credits_info')
-            
-            if credits_info and 'data' in credits_info:
-                data = credits_info['data']
-                # Display credit balance
-                if 'limit' in data and data['limit'] is not None:
-                    limit = float(data.get('limit', 0))
-                    usage = float(data.get('usage', 0))
-                    remaining = limit - usage
-                    
-                    if remaining > 0:
-                        st.success(f"💰 剩餘額度：${remaining:.2f}")
-                    else:
-                        st.error(f"⚠️ 額度已用完")
-                    
-                    # Show usage bar
-                    if limit > 0:
-                        usage_percent = (usage / limit) * 100
-                        st.progress(min(usage_percent / 100, 1.0))
-                        st.caption(f"已使用：${usage:.2f} / ${limit:.2f} ({usage_percent:.1f}%)")
-                else:
-                    # Unlimited or rate-limited key
-                    st.info("✓ API 金鑰有效")
-            elif credits_info is None:
-                st.warning("⚠️ 無法檢查 API 額度")
-        
-        model = st.selectbox(
-            "模型",
-            options=POPULAR_MODELS,
+        st.caption(f"已登入：{getattr(st.user, 'email', '未知帳號')}")
+        if st.button("登出", key="sidebar_logout"):
+            st.logout()
+            st.stop()
+
+        provider = st.selectbox(
+            "供應商",
+            options=LLM_PROVIDERS,
             index=0,
-            help="選擇用於校對的 LLM 模型"
+            help="選擇要使用的 LLM 供應商",
+            disabled=is_proofreading
         )
+
+        api_key = ""
+        google_vertex_ready = False
+        provider_models = OPENROUTER_MODELS if provider == "openrouter" else []
+
+        if provider == "openrouter":
+            api_key = st.secrets.get("openrouter", {}).get("api_key", "")
+            if not api_key:
+                st.warning("⚠️ 未在 secrets.toml 找到 OpenRouter API 金鑰（[openrouter].api_key）")
+
+        if provider == "google":
+            google_settings = st.secrets.get("google_vertex", {})
+            raw_service_account = google_settings.get("service_account_json")
+            project_id = google_settings.get("project_id")
+            location = google_settings.get("location")
+
+            if not project_id:
+                st.error("⚠️ Google Vertex 設定無效：缺少 [google_vertex].project_id")
+            elif not location:
+                st.error("⚠️ Google Vertex 設定無效：缺少 [google_vertex].location")
+            elif raw_service_account:
+                try:
+                    service_account_info = parse_google_service_account_info(raw_service_account)
+                    google_vertex_ready = True
+
+                    if GOOGLE_VERTEX_MODELS:
+                        provider_models = GOOGLE_VERTEX_MODELS
+                    else:
+                        cache_key = (
+                            f"google_vertex_models::{project_id}::{location}::"
+                            f"{service_account_info.get('client_email', '')}"
+                        )
+                        if st.session_state.get("google_vertex_models_cache_key") != cache_key:
+                            st.session_state.google_vertex_models_cache_key = cache_key
+                            st.session_state.google_vertex_dynamic_models = []
+                            st.session_state.google_vertex_dynamic_models_error = ""
+
+                        if not st.session_state.get("google_vertex_dynamic_models"):
+                            try:
+                                google_client_for_models = get_google_vertex_client()
+                                st.session_state.google_vertex_dynamic_models = fetch_google_vertex_models(google_client_for_models)
+                                st.session_state.google_vertex_dynamic_models_error = ""
+                            except Exception as fetch_error:
+                                st.session_state.google_vertex_dynamic_models_error = str(fetch_error)
+
+                        provider_models = st.session_state.get("google_vertex_dynamic_models", [])
+                        if not provider_models and st.session_state.get("google_vertex_dynamic_models_error"):
+                            st.warning(
+                                "⚠️ 無法自動取得 Google 模型，"
+                                f"錯誤：{st.session_state.google_vertex_dynamic_models_error}"
+                            )
+                        elif not provider_models:
+                            st.warning("⚠️ Vertex AI 未回傳可用 Gemini 模型")
+                except ValueError as config_error:
+                    st.error(f"⚠️ Google Vertex 設定無效：{config_error}")
+            else:
+                st.warning("⚠️ 未在 secrets.toml 找到 Google Vertex 設定（[google_vertex].service_account_json）")
+
+        model = ""
+        if provider_models:
+            model = st.selectbox(
+                "模型",
+                options=provider_models,
+                index=0,
+                help="選擇用於校對的 LLM 模型",
+                disabled=is_proofreading
+            )
+        else:
+            st.warning("⚠️ 目前沒有可用模型可供選擇")
         
         author_name = st.text_input(
             "作者名稱",
             value="紅出版",
-            help="顯示在追蹤修訂中的名稱"
+            help="顯示在追蹤修訂中的名稱",
+            disabled=is_proofreading
         )
         
         # ============================================================
@@ -855,13 +1245,13 @@ def main():
         
         # Mode toggle button
         if not st.session_state.creating_new_prompt:
-            if st.button("➕ 新增提示", use_container_width=True, type="secondary"):
+            if st.button("➕ 新增提示", use_container_width=True, type="secondary", disabled=is_proofreading):
                 st.session_state.creating_new_prompt = True
                 st.session_state.new_prompt_name_input = ""
                 st.session_state.confirm_delete_target = None
                 st.rerun()
         else:
-            if st.button("⬅️ 返回", use_container_width=True, type="secondary"):
+            if st.button("⬅️ 返回", use_container_width=True, type="secondary", disabled=is_proofreading):
                 st.session_state.creating_new_prompt = False
                 st.session_state.confirm_delete_target = None
                 st.rerun()
@@ -876,7 +1266,8 @@ def main():
             new_prompt_name = st.text_input(
                 "新提示名稱",
                 value=st.session_state.get('new_prompt_name_input', ''),
-                key="new_prompt_name"
+                key="new_prompt_name",
+                disabled=is_proofreading
             )
             
             # Template selector - use existing prompts as templates
@@ -891,7 +1282,8 @@ def main():
                 "從範本開始",
                 options=template_options,
                 key="template_selector",
-                on_change=on_template_change
+                on_change=on_template_change,
+                disabled=is_proofreading
             )
             
             # Reuse the textarea UI for new prompt content
@@ -900,11 +1292,12 @@ def main():
                 value="",
                 height=250,
                 help="編輯新提示的內容",
-                key="new_prompt_content"
+                key="new_prompt_content",
+                disabled=is_proofreading
             )
             
             # Create button
-            if st.button("💾 建立提示", use_container_width=True, type="secondary", key="create_new"):
+            if st.button("💾 建立提示", use_container_width=True, type="secondary", key="create_new", disabled=is_proofreading):
                 if not new_prompt_name or not new_prompt_name.strip():
                     st.error("請輸入提示名稱")
                 elif not new_prompt_content or not new_prompt_content.strip():
@@ -948,7 +1341,8 @@ def main():
                 options=prompt_names,
                 key="prompt_selector",
                 on_change=on_selector_change,
-                help="選擇要使用的提示範本"
+                help="選擇要使用的提示範本",
+                disabled=is_proofreading
             )
             
             # Get selected prompt details
@@ -967,7 +1361,7 @@ def main():
                 height=250,
                 help="此提示受保護，無法編輯" if is_protected else "編輯提示內容",
                 key=f"prompt_content_{selected_prompt_name}",
-                disabled=is_protected,
+                disabled=is_protected or is_proofreading,
                 on_change=on_prompt_change
             )
             
@@ -978,7 +1372,7 @@ def main():
             content_modified = current_prompt_content != original_content
             
             # Save button - only enabled when content is modified and not protected
-            save_disabled = is_protected or not content_modified
+            save_disabled = is_protected or not content_modified or is_proofreading
             if st.button(
                 f"💾 儲存",
                 disabled=save_disabled,
@@ -996,7 +1390,7 @@ def main():
                     st.error(message)
             
             # Delete button with confirmation
-            delete_disabled = is_protected
+            delete_disabled = is_protected or is_proofreading
             
             # Initialize confirmation state
             if 'confirm_delete_target' not in st.session_state:
@@ -1019,7 +1413,7 @@ def main():
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    if st.button("✅ 確認刪除", use_container_width=True, type="primary", key="confirm_delete_yes"):
+                    if st.button("✅ 確認刪除", use_container_width=True, type="primary", key="confirm_delete_yes", disabled=is_proofreading):
                         success, message = delete_prompt(prompts, selected_prompt_name)
                         if success:
                             st.success(message)
@@ -1033,7 +1427,7 @@ def main():
                             st.session_state.confirm_delete_target = None
                 
                 with col2:
-                    if st.button("❌ 取消", use_container_width=True, key="confirm_delete_no"):
+                    if st.button("❌ 取消", use_container_width=True, key="confirm_delete_no", disabled=is_proofreading):
                         st.session_state.confirm_delete_target = None
                         st.rerun()
             
@@ -1049,7 +1443,8 @@ def main():
                 max_value=100,
                 value=100,
                 step=1,
-                help="測試用：僅處理文件的一部分（例如 10% = 前 10% 的段落）"
+                help="測試用：僅處理文件的一部分（例如 10% = 前 10% 的段落）",
+                disabled=is_proofreading
             )
             st.caption(f"將處理文件的 {process_percentage}%")
         
@@ -1060,12 +1455,16 @@ def main():
     uploaded_file = st.file_uploader(
         "上傳 Word 文件 (.docx)",
         type=["docx"],
-        help="選擇要校對的 .docx 檔案"
+        help="選擇要校對的 .docx 檔案",
+        disabled=is_proofreading
     )
     
     if uploaded_file is not None:
-        if not api_key:
-            st.warning("⚠️ 請在側邊欄輸入您的 OpenRouter API 金鑰")
+        if provider == "openrouter" and not api_key:
+            st.warning("⚠️ 請在 secrets.toml 設定 OpenRouter API 金鑰（[openrouter].api_key）")
+            return
+        if provider == "google" and not google_vertex_ready:
+            st.warning("⚠️ 請在 secrets.toml 設定 Google Vertex 憑證（[google_vertex].service_account_json）")
             return
         
         file_bytes = uploaded_file.getvalue()
@@ -1128,58 +1527,177 @@ def main():
                     if len(document_text) > 2000:
                         st.caption(f"顯示前 2000 個字元。勾選「顯示完整文件」以查看更多內容。")
             
-            if st.button("🚀 開始校對", type="primary", use_container_width=True):
-                client = get_openrouter_client(api_key)
-                
-                # Fetch and cache model info for dynamic chunk sizing
-                cache_key = f"model_info_{model}"
-                if cache_key not in st.session_state:
-                    with st.spinner("📡 取得模型資訊..."):
-                        st.session_state[cache_key] = fetch_model_info(api_key, model)
-                model_info = st.session_state[cache_key]
-                
-                with st.spinner(f"🤖 使用 {model} 校對中..."):
-                    result = proofread_with_llm(
-                        client,
-                        model,
-                        rdoc,
-                        system_prompt,
-                        max_workers=DEFAULT_MAX_WORKERS,
-                        process_percentage=process_percentage,
-                        model_info=model_info
-                    )
-                
-                if result is None:
-                    st.error("❌ 無法取得校對結果")
-                else:
-                    st.session_state["proofread_result_data"] = result.model_dump()
-                    st.session_state["proofread_result_doc_signature"] = current_doc_signature
-                    st.session_state["edit_page"] = 1
+            if st.button("🚀 開始校對", type="primary", use_container_width=True, disabled=is_proofreading):
+                if not model:
+                    st.error("⚠️ 尚未取得可用模型，請確認供應商設定後重試")
+                    st.stop()
+                st.session_state["is_proofreading"] = True
+                st.rerun()
+            
+            # Run proofreading on the rerun where all widgets are already disabled
+            if is_proofreading:
+                run_start_time = time.time()
+                debug_run_id = None
+                try:
+                    from debug_logging import create_run as log_create_run, update_run_completed as log_update_run_completed, update_run_failed as log_update_run_failed
 
-                    if result.edits:
-                        with st.spinner("✏️ 套用追蹤修訂中..."):
-                            stats = apply_tracked_changes(rdoc, result.edits, author_name)
+                    model_info = None
+                    if provider == "openrouter":
+                        client = get_openrouter_client(api_key)
 
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_output:
-                            tmp_output_path = tmp_output.name
-
-                        rdoc.save(tmp_output_path)
-
-                        with open(tmp_output_path, "rb") as f:
-                            output_data = f.read()
-
-                        os.unlink(tmp_output_path)
-
-                        original_name = uploaded_file.name.rsplit(".", 1)[0]
-                        output_filename = f"{original_name}_proofread.docx"
-
-                        st.session_state["proofread_stats"] = stats
-                        st.session_state["proofread_output_data"] = output_data
-                        st.session_state["proofread_output_filename"] = output_filename
+                        # Fetch and cache model info for dynamic chunk sizing
+                        cache_key = f"model_info_{provider}_{model}"
+                        if cache_key not in st.session_state or st.session_state.get(cache_key) is None:
+                            with st.spinner("📡 取得模型資訊..."):
+                                st.session_state[cache_key] = fetch_model_info(api_key, model)
+                        model_info = st.session_state[cache_key]
                     else:
-                        st.session_state["proofread_stats"] = None
-                        st.session_state["proofread_output_data"] = None
-                        st.session_state["proofread_output_filename"] = None
+                        client = get_google_vertex_client()
+
+                        # Fetch and cache model info for dynamic chunk sizing
+                        cache_key = f"model_info_{provider}_{model}"
+                        if cache_key not in st.session_state or st.session_state.get(cache_key) is None:
+                            with st.spinner("📡 取得模型資訊..."):
+                                google_model_info, google_model_debug = fetch_google_model_info(client, model)
+                                st.session_state[cache_key] = google_model_info
+                                st.session_state[f"model_info_debug_{provider}_{model}"] = google_model_debug
+                        model_info = st.session_state[cache_key]
+
+                    # Compute chunk info for logging before calling proofread_with_llm
+                    total_paragraphs_count = len(rdoc.paragraphs)
+                    paragraphs_to_process_count = max(1, int(total_paragraphs_count * process_percentage / 100))
+                    if model_info and model_info.get("context_length", 0) > 0:
+                        log_chunk_size = compute_dynamic_chunk_size(
+                            rdoc, system_prompt,
+                            model_info["context_length"],
+                            model_info.get("max_completion_tokens", 0),
+                            process_percentage
+                        )
+                    else:
+                        log_chunk_size = DEFAULT_CHUNK_SIZE
+                    log_total_chunks = (paragraphs_to_process_count + log_chunk_size - 1) // log_chunk_size
+
+                    # Build document paragraphs snapshot for logging
+                    doc_paragraphs = [
+                        {"index": i, "text": rdoc.paragraphs[i].text}
+                        for i in range(total_paragraphs_count)
+                    ]
+
+                    # Determine the prompt name used
+                    log_prompt_name = selected_prompt_name if not st.session_state.get("creating_new_prompt") else "(新建提示)"
+
+                    # Create debug run record
+                    try:
+                        sb = get_supabase_client()
+                        debug_run_id = log_create_run(
+                            sb,
+                            user_email=st.user.email if hasattr(st, "user") and st.user else "unknown",
+                            file_name=uploaded_file.name,
+                            file_hash=current_doc_signature,
+                            provider=provider,
+                            model=model,
+                            prompt_name=log_prompt_name,
+                            prompt_content=system_prompt,
+                            process_percentage=process_percentage,
+                            total_paragraphs=total_paragraphs_count,
+                            paragraphs_processed=paragraphs_to_process_count,
+                            chunk_size=log_chunk_size,
+                            total_chunks=log_total_chunks,
+                            model_info=model_info,
+                            document_paragraphs=doc_paragraphs,
+                        )
+                    except Exception:
+                        sb = None
+                        debug_run_id = None
+                    
+                    with st.spinner(f"🤖 使用 {provider}/{model} 校對中..."):
+                        result = proofread_with_llm(
+                            client,
+                            provider,
+                            model,
+                            rdoc,
+                            system_prompt,
+                            max_workers=DEFAULT_MAX_WORKERS,
+                            process_percentage=process_percentage,
+                            model_info=model_info,
+                            run_id=debug_run_id,
+                            supabase_client=sb if debug_run_id else None
+                        )
+                    
+                    if result is None:
+                        st.error("❌ 無法取得校對結果")
+                        # Log run failure
+                        if debug_run_id and sb:
+                            try:
+                                log_update_run_failed(
+                                    sb, debug_run_id,
+                                    error_message="proofread_with_llm returned None",
+                                    duration_seconds=time.time() - run_start_time,
+                                )
+                            except Exception:
+                                pass
+                    else:
+                        st.session_state["proofread_result_data"] = result.model_dump()
+                        st.session_state["proofread_result_doc_signature"] = current_doc_signature
+                        st.session_state["edit_page"] = 1
+
+                        # Log run success
+                        if debug_run_id and sb:
+                            try:
+                                log_update_run_completed(
+                                    sb, debug_run_id,
+                                    total_edits=len(result.edits),
+                                    duration_seconds=time.time() - run_start_time,
+                                    combined_summary=result.summary,
+                                    warnings=[],
+                                )
+                            except Exception:
+                                pass
+
+                        # Snapshot original paragraph texts before apply_tracked_changes modifies rdoc
+                        st.session_state["original_paragraph_texts"] = {
+                            i: rdoc.paragraphs[i].text for i in range(len(rdoc.paragraphs))
+                        }
+
+                        if result.edits:
+                            with st.spinner("✏️ 套用追蹤修訂中..."):
+                                stats = apply_tracked_changes(rdoc, result.edits, author_name)
+
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_output:
+                                tmp_output_path = tmp_output.name
+
+                            rdoc.save(tmp_output_path)
+
+                            with open(tmp_output_path, "rb") as f:
+                                output_data = f.read()
+
+                            os.unlink(tmp_output_path)
+
+                            original_name = uploaded_file.name.rsplit(".", 1)[0]
+                            output_filename = f"{original_name}_proofread.docx"
+
+                            st.session_state["proofread_stats"] = stats
+                            st.session_state["proofread_output_data"] = output_data
+                            st.session_state["proofread_output_filename"] = output_filename
+                        else:
+                            st.session_state["proofread_stats"] = None
+                            st.session_state["proofread_output_data"] = None
+                            st.session_state["proofread_output_filename"] = None
+                except Exception as exc:
+                    # Log unexpected failure
+                    if debug_run_id:
+                        try:
+                            sb = get_supabase_client()
+                            log_update_run_failed(
+                                sb, debug_run_id,
+                                error_message=str(exc),
+                                duration_seconds=time.time() - run_start_time,
+                            )
+                        except Exception:
+                            pass
+                    raise
+                finally:
+                    st.session_state["is_proofreading"] = False
 
             stored_result_data = st.session_state.get("proofread_result_data")
             if stored_result_data and st.session_state.get("proofread_result_doc_signature") == current_doc_signature:
@@ -1199,16 +1717,52 @@ def main():
                             edits_per_page = DEFAULT_EDITS_PER_PAGE
                             total_edit_pages = (total_edits + edits_per_page - 1) // edits_per_page
 
-                            edit_page = st.number_input(
-                                f"修改頁面 (1-{total_edit_pages})",
-                                min_value=1,
-                                max_value=total_edit_pages,
-                                value=1,
-                                step=1,
-                                key="edit_page"
-                            )
+                            # Initialize and clamp page
+                            if 'edit_page' not in st.session_state:
+                                st.session_state.edit_page = 1
+                            st.session_state.edit_page = max(1, min(st.session_state.edit_page, total_edit_pages))
+                            
+                            page_options = list(range(1, total_edit_pages + 1))
 
-                            start_edit = (edit_page - 1) * edits_per_page
+                            # Sync both selectbox keys to current page BEFORE widgets render
+                            st.session_state["ep_sel_top"] = st.session_state.edit_page
+                            st.session_state["ep_sel_bottom"] = st.session_state.edit_page
+
+                            def _on_select_change(key_suffix):
+                                st.session_state.edit_page = st.session_state[f"ep_sel_{key_suffix}"]
+
+                            def _on_prev():
+                                st.session_state.edit_page = max(1, st.session_state.edit_page - 1)
+
+                            def _on_next():
+                                st.session_state.edit_page = min(total_edit_pages, st.session_state.edit_page + 1)
+
+                            def _render_edit_pagination(key_suffix: str):
+                                """Render [Prev] [Dropdown] [Next] pagination row."""
+                                col_prev, col_select, col_next = st.columns([1, 2, 1])
+                                with col_prev:
+                                    st.button("⬅️ 上一頁", key=f"ep_prev_{key_suffix}",
+                                              disabled=(st.session_state.edit_page <= 1),
+                                              use_container_width=True, on_click=_on_prev)
+                                with col_select:
+                                    st.selectbox(
+                                        "頁面",
+                                        options=page_options,
+                                        format_func=lambda x: f"第 {x} / {total_edit_pages} 頁",
+                                        key=f"ep_sel_{key_suffix}",
+                                        label_visibility="collapsed",
+                                        on_change=_on_select_change,
+                                        args=(key_suffix,)
+                                    )
+                                with col_next:
+                                    st.button("下一頁 ➡️", key=f"ep_next_{key_suffix}",
+                                              disabled=(st.session_state.edit_page >= total_edit_pages),
+                                              use_container_width=True, on_click=_on_next)
+
+                            # Top pagination
+                            _render_edit_pagination("top")
+
+                            start_edit = (st.session_state.edit_page - 1) * edits_per_page
                             end_edit = min(start_edit + edits_per_page, total_edits)
                             edits_to_show = result.edits[start_edit:end_edit]
                             edit_offset = start_edit
@@ -1219,30 +1773,29 @@ def main():
                         for i, edit in enumerate(edits_to_show, edit_offset + 1):
                             st.markdown(f"**修改 {i}** (段落 {edit.paragraph_index})")
 
-                            # Look up original text from document
-                            if 0 <= edit.paragraph_index < len(rdoc.paragraphs):
+                            # Look up original text from snapshot (before apply_tracked_changes modified rdoc)
+                            orig_texts = st.session_state.get("original_paragraph_texts", {})
+                            if edit.paragraph_index in orig_texts:
+                                original_text = orig_texts[edit.paragraph_index]
+                            elif 0 <= edit.paragraph_index < len(rdoc.paragraphs):
                                 original_text = rdoc.paragraphs[edit.paragraph_index].text
                             else:
                                 original_text = "(段落索引超出範圍)"
 
-                            diffs = compute_character_diffs(original_text, edit.corrected_text)
-
-                            st.markdown("**原文：**")
-                            st.code(original_text, language=None)
-                            st.markdown("**修正後：**")
-                            st.code(edit.corrected_text, language=None)
-
-                            st.markdown("**字元級別修改：**")
-                            for op, start, end, text in diffs:
-                                if op == 'delete':
-                                    st.markdown(f"🔴 刪除位置 {start}-{end}：`{text}`")
-                                elif op == 'insert':
-                                    st.markdown(f"🟢 插入位置 {start}：`{text}`")
-                                elif op == 'replace':
-                                    st.markdown(f"🟡 替換位置 {start}-{end} 為：`{text}`")
+                            tracked_html = render_tracked_changes_html(original_text, edit.corrected_text)
+                            st.markdown(
+                                f'<div style="padding:0.75em 1em;border:1px solid #ddd;border-radius:6px;'
+                                f'line-height:1.8;font-size:1rem;white-space:pre-wrap;">'
+                                f'{tracked_html}</div>',
+                                unsafe_allow_html=True
+                            )
 
                             st.caption(f"💡 {edit.reason}")
                             st.markdown("---")
+
+                        # Bottom pagination (only if paginated)
+                        if total_edits > DEFAULT_EDITS_PER_PAGE:
+                            _render_edit_pagination("bottom")
 
                     stats = st.session_state.get("proofread_stats")
                     if stats:
