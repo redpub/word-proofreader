@@ -669,7 +669,7 @@ def proofread_chunk_with_llm(
             return None, warnings, debug_info
         
         try:
-            data = json.loads(content)
+            data = json.JSONDecoder(strict=False).decode(content)
         except json.JSONDecodeError as je:
             warnings.append(f"無法解析 LLM 回應的 JSON{chunk_info}：{str(je)}")
             return None, warnings, debug_info
@@ -786,7 +786,7 @@ def proofread_chunk_with_google_llm(
             return None, warnings, debug_info
 
         try:
-            data = json.loads(content)
+            data = json.JSONDecoder(strict=False).decode(content)
         except json.JSONDecodeError as je:
             warnings.append(f"無法解析 Google Vertex 回應的 JSON{chunk_info}：{str(je)}")
             return None, warnings, debug_info
