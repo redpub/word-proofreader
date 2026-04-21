@@ -1,3 +1,4 @@
+import copy
 import streamlit as st
 import tempfile
 import os
@@ -1041,6 +1042,52 @@ def compute_character_diffs(original: str, corrected: str) -> List[Tuple[str, in
     
     return diffs
 
+def _build_char_rpr_map(para_p) -> List:
+    """Build a per-character list of w:rPr elements from the paragraph's direct-child runs.
+
+    Returns a list where index i holds a deepcopy of the w:rPr of the original run
+    that owned character i in paragraph.text (the same view the library uses for
+    index_mode='text').  Returns an empty list if the paragraph has no runs.
+    """
+    from docx.oxml.ns import qn
+    char_rpr: List = []
+    for r in para_p.xpath('./w:r'):
+        rpr = r.find(qn('w:rPr'))
+        rpr_copy = copy.deepcopy(rpr) if rpr is not None else None
+        run_text = ''.join(t.text or '' for t in r.xpath('./w:t | ./w:delText'))
+        char_rpr.extend([rpr_copy] * len(run_text))
+    return char_rpr
+
+
+def _apply_rpr_to_new_elements(para_p, known_elements: set, rpr_template) -> None:
+    """Find elements added to para_p since known_elements was captured and stamp their
+    bare w:r children with rpr_template.
+
+    Only touches runs that have no w:rPr (or an empty one) — i.e. the bare runs
+    the library creates — so existing formatting is never overwritten.
+    """
+    if rpr_template is None:
+        return
+    from docx.oxml.ns import qn
+    for child in para_p:
+        if child in known_elements:
+            continue
+        # New element: could be a w:ins, w:del, or a bare w:r (split remnant)
+        if child.tag in (qn('w:ins'), qn('w:del')):
+            for r in child.findall(qn('w:r')):
+                existing = r.find(qn('w:rPr'))
+                if existing is None or len(existing) == 0:
+                    if existing is not None:
+                        r.remove(existing)
+                    r.insert(0, copy.deepcopy(rpr_template))
+        elif child.tag == qn('w:r'):
+            existing = child.find(qn('w:rPr'))
+            if existing is None or len(existing) == 0:
+                if existing is not None:
+                    child.remove(existing)
+                child.insert(0, copy.deepcopy(rpr_template))
+
+
 def apply_tracked_changes(
     rdoc: RevisionDocument,
     edits: List[Edit],
@@ -1070,12 +1117,32 @@ def apply_tracked_changes(
             
             # Use the actual document text as the original for diffing
             original_text = current_text
+
+            # Snapshot per-character rPr BEFORE any library call touches the paragraph.
+            # char_rpr[i] is a deepcopy of the w:rPr owned by original character i.
+            para_p = para_element._p
+            char_rpr = _build_char_rpr_map(para_p)
             
             rp = RevisionParagraph.from_paragraph(para_element)
             diffs = compute_character_diffs(original_text, edit.corrected_text)
             
             # Process diffs in reverse order to maintain correct positions
             for op, start, end, text in reversed(diffs):
+                # Snapshot existing element references so we can identify what the
+                # library creates during this single operation.
+                # Storing actual objects (not id() integers) keeps old proxies alive,
+                # preventing CPython from reusing their memory addresses for newly
+                # created elements — which would make id()-based checks unreliable.
+                known_elements = set(para_p)
+
+                # Determine the rPr to stamp on newly created bare runs.
+                # Use the rPr at `start`; fall back to the last character's rPr
+                # for append-at-end insertions into non-empty paragraphs.
+                if char_rpr:
+                    rpr_for_op = char_rpr[min(start, len(char_rpr) - 1)]
+                else:
+                    rpr_for_op = None
+
                 if op == 'delete':
                     rp.add_tracked_deletion(
                         start=start,
@@ -1123,6 +1190,9 @@ def apply_tracked_changes(
                     )
                     stats["deletions"] += 1
                     stats["insertions"] += 1
+
+                # Stamp the correct rPr onto every bare run the library just created.
+                _apply_rpr_to_new_elements(para_p, known_elements, rpr_for_op)
                     
         except Exception as e:
             stats["errors"] += 1
