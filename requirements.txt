@@ -12,7 +12,7 @@ click==8.3.1
 cryptography==46.0.6
 deprecation==2.1.0
 distro==1.9.0
-docx-revisions==0.1.4
+docx-revisions==0.1.5
 fsspec==2026.3.0
 gitdb==4.0.12
 GitPython==3.1.41
