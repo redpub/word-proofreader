@@ -7,14 +7,12 @@ import time
 import re
 import traceback
 import hashlib
-import copy
 import requests
 from collections import OrderedDict
 from typing import Any, List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from docx_revisions import RevisionDocument, RevisionParagraph
-from docx.oxml.ns import qn as _qn
 from pydantic import BaseModel
 from supabase import create_client, Client
 from db_tables import get_table_name
@@ -1043,133 +1041,6 @@ def compute_character_diffs(original: str, corrected: str) -> List[Tuple[str, in
     
     return diffs
 
-def _snapshot_run_formatting(p_element) -> List[Tuple[int, int, Any]]:
-    """
-    Walk the paragraph XML element in document order and return a list of
-    (run_start_offset, run_end_offset, rPr_deepcopy_or_None) for every w:r.
-
-    Traversal follows the "original text" view: w:del children are included
-    (their text is still present), w:ins children are excluded (they were
-    not in the original).  This keeps the returned offsets aligned with the
-    pre-diff paragraph.text coordinate space.
-
-    w:rPrChange is stripped from every copied rPr so that revision-history
-    metadata is not accidentally carried into newly-created runs.
-    """
-    W_R       = _qn('w:r')
-    W_INS     = _qn('w:ins')
-    W_DEL     = _qn('w:del')
-    W_T       = _qn('w:t')
-    W_DELTEXT = _qn('w:delText')
-    W_RPR     = _qn('w:rPr')
-    W_RPRCHG  = _qn('w:rPrChange')
-
-    result: List[Tuple[int, int, Any]] = []
-    offset = 0
-
-    def walk(element: Any) -> None:
-        nonlocal offset
-        for child in element:
-            tag = child.tag
-            if tag == W_R:
-                run_start = offset
-                run_len = sum(
-                    len(t.text or '')
-                    for t in child
-                    if t.tag in (W_T, W_DELTEXT)
-                )
-                rPr_elem = child.find(W_RPR)
-                if rPr_elem is not None:
-                    rPr_copy = copy.deepcopy(rPr_elem)
-                    rPrChange = rPr_copy.find(W_RPRCHG)
-                    if rPrChange is not None:
-                        rPr_copy.remove(rPrChange)
-                    result.append((run_start, run_start + run_len, rPr_copy))
-                else:
-                    result.append((run_start, run_start + run_len, None))
-                offset += run_len
-            elif tag == W_DEL:
-                # Original text — recurse and count
-                walk(child)
-            elif tag == W_INS:
-                # New text not in original — skip entirely
-                pass
-
-    walk(p_element)
-    return result
-
-
-def _repair_run_formatting(
-    p_element: Any,
-    snapshots: List[Tuple[int, int, Any]],
-) -> None:
-    """
-    Post-operation repair: for every w:r in the paragraph that has no w:rPr,
-    look up the closest original run in *snapshots* (by text offset in the
-    original coordinate space) and copy its rPr.
-
-    If the closest original run also had no rPr (i.e., inherited from the
-    paragraph style), the bare run is left untouched — matching the original
-    behaviour.
-
-    Traversal uses the same "original view" offset accounting as
-    _snapshot_run_formatting so that the two coordinate spaces align:
-    w:del content is counted (original text, still in DOM),
-    w:ins content does not advance the offset counter (new text).
-    """
-    if not snapshots:
-        return
-
-    W_R       = _qn('w:r')
-    W_INS     = _qn('w:ins')
-    W_DEL     = _qn('w:del')
-    W_T       = _qn('w:t')
-    W_DELTEXT = _qn('w:delText')
-    W_RPR     = _qn('w:rPr')
-
-    def find_rPr_for_offset(offset: int) -> Any:
-        """Return the rPr (or None) from the snapshot entry closest to *offset*."""
-        best_rPr  = None
-        best_dist = float('inf')
-        for s_start, s_end, rPr in snapshots:
-            if s_start <= offset < s_end:
-                return rPr                          # exact hit — return immediately
-            dist = min(abs(offset - s_start), abs(offset - s_end))
-            if dist < best_dist:
-                best_dist = dist
-                best_rPr  = rPr
-        return best_rPr
-
-    offset = 0
-
-    def walk(element: Any, inside_ins: bool = False) -> None:
-        nonlocal offset
-        for child in element:
-            tag = child.tag
-            if tag == W_R:
-                run_len = sum(
-                    len(t.text or '')
-                    for t in child
-                    if t.tag in (W_T, W_DELTEXT)
-                )
-                if child.find(W_RPR) is None and run_len > 0:
-                    rPr_to_apply = find_rPr_for_offset(offset)
-                    if rPr_to_apply is not None:
-                        child.insert(0, copy.deepcopy(rPr_to_apply))
-                # Only advance the original-space offset for non-insertion runs
-                if not inside_ins:
-                    offset += run_len
-            elif tag == W_INS:
-                # Recurse into w:ins but mark as "inside insertion"
-                # so the offset counter does not advance for those runs.
-                walk(child, inside_ins=True)
-            elif tag == W_DEL:
-                # Recurse normally; w:del text counts in original-space.
-                walk(child, inside_ins=False)
-
-    walk(p_element)
-
-
 def apply_tracked_changes(
     rdoc: RevisionDocument,
     edits: List[Edit],
@@ -1202,11 +1073,7 @@ def apply_tracked_changes(
             
             rp = RevisionParagraph.from_paragraph(para_element)
             diffs = compute_character_diffs(original_text, edit.corrected_text)
-
-            # Snapshot run formatting BEFORE any mutations so the repair
-            # pass can restore rPr on runs that the library creates bare.
-            run_fmt_snapshot = _snapshot_run_formatting(para_element._element)
-
+            
             # Process diffs in reverse order to maintain correct positions
             for op, start, end, text in reversed(diffs):
                 if op == 'delete':
@@ -1256,11 +1123,7 @@ def apply_tracked_changes(
                     )
                     stats["deletions"] += 1
                     stats["insertions"] += 1
-
-            # Restore rPr on any bare runs the library created during the
-            # diff operations above.
-            _repair_run_formatting(para_element._element, run_fmt_snapshot)
-
+                    
         except Exception as e:
             stats["errors"] += 1
             stats["failed_edits"].append({
